@@ -1,0 +1,181 @@
+name: Build SafariWipe dylib
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Tạo mã nguồn SafariWipe.m
+        run: |
+          cat << 'EOF' > SafariWipe.m
+          #import <Foundation/Foundation.h>
+          #import <UIKit/UIKit.h>
+          #import <WebKit/WebKit.h>
+          #import <Security/Security.h>
+          #import <notify.h>
+          #import <stdlib.h>
+
+          static UIWindow* GetActiveWindow(void) {
+              for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+                  if (scene.activationState == UISceneActivationStateForegroundActive && [scene isKindOfClass:[UIWindowScene class]]) {
+                      UIWindowScene *windowScene = (UIWindowScene *)scene;
+                      for (UIWindow *window in windowScene.windows) {
+                          if (window.isKeyWindow) return window;
+                      }
+                      if (windowScene.windows.count > 0) return windowScene.windows.firstObject;
+                  }
+              }
+              return [UIApplication sharedApplication].windows.firstObject;
+          }
+
+          static void PerformSafariDeepWipe(BOOL shouldExitAfterWipe) {
+              dispatch_async(dispatch_get_main_queue(), ^{
+                  // 1. Xóa toàn bộ các lớp dữ liệu Keychain của Safari
+                  NSArray *secClasses = @[
+                      (__bridge id)kSecClassGenericPassword,
+                      (__bridge id)kSecClassInternetPassword,
+                      (__bridge id)kSecClassCertificate,
+                      (__bridge id)kSecClassKey,
+                      (__bridge id)kSecClassIdentity
+                  ];
+
+                  for (id secClass in secClasses) {
+                      NSDictionary *querySync = @{
+                          (__bridge id)kSecClass: secClass,
+                          (__bridge id)kSecAttrSynchronizable: (__bridge id)kSecAttrSynchronizableAny
+                      };
+                      SecItemDelete((__bridge CFDictionaryRef)querySync);
+
+                      NSDictionary *queryLocal = @{ (__bridge id)kSecClass: secClass };
+                      SecItemDelete((__bridge CFDictionaryRef)queryLocal);
+                  }
+
+                  // 2. Xóa Cookies & URLCache
+                  NSHTTPCookieStorage *cookieStorage = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+                  for (NSHTTPCookie *cookie in [cookieStorage cookies]) {
+                      [cookieStorage deleteCookie:cookie];
+                  }
+                  [[NSURLCache sharedURLCache] removeAllCachedResponses];
+
+                  // 3. Xóa NSUserDefaults
+                  NSString *bundleID = [[NSBundle mainBundle] bundleIdentifier];
+                  if (bundleID) {
+                      [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bundleID];
+                      [[NSUserDefaults standardUserDefaults] synchronize];
+                  }
+
+                  // 4. Xóa dữ liệu lưu trong Sandbox Container
+                  NSFileManager *fm = [NSFileManager defaultManager];
+                  NSString *homeDir = NSHomeDirectory();
+                  NSArray *subPaths = @[@"Library/Caches", @"Library/Cookies", @"Library/WebKit", @"Library/Safari", @"tmp"];
+                  for (NSString *relPath in subPaths) {
+                      NSString *fullPath = [homeDir stringByAppendingPathComponent:relPath];
+                      NSArray *contents = [fm contentsOfDirectoryAtPath:fullPath error:nil];
+                      for (NSString *item in contents) {
+                          [fm removeItemAtPath:[fullPath stringByAppendingPathComponent:item] error:nil];
+                      }
+                  }
+
+                  // 5. Xóa sạch WKWebsiteDataStore (IndexedDB, LocalStorage, WebKit Cookies)
+                  NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
+                  NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
+                  [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:allTypes
+                                                             modifiedSince:epoch
+                                                         completionHandler:^{
+                      if (shouldExitAfterWipe) {
+                          exit(0);
+                      }
+                  }];
+              });
+          }
+
+          @interface SWWipeGestureHandler : NSObject
+          + (instancetype)shared;
+          - (void)handleTripleFingerTap:(UITapGestureRecognizer *)gesture;
+          @end
+
+          @implementation SWWipeGestureHandler
+          + (instancetype)shared {
+              static SWWipeGestureHandler *instance = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{ instance = [[self alloc] init]; });
+              return instance;
+          }
+
+          - (void)handleTripleFingerTap:(UITapGestureRecognizer *)gesture {
+              if (gesture.state == UIGestureRecognizerStateEnded) {
+                  UIWindow *window = GetActiveWindow();
+                  UIViewController *rootVC = window.rootViewController;
+                  while (rootVC.presentedViewController) {
+                      rootVC = rootVC.presentedViewController;
+                  }
+                  UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Deep Wipe"
+                                                                                 message:@"Đang xóa sạch Keychain & WebKit..."
+                                                                          preferredStyle:UIAlertControllerStyleAlert];
+                  if (rootVC) {
+                      [rootVC presentViewController:alert animated:YES completion:^{
+                          dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                              PerformSafariDeepWipe(YES);
+                          });
+                      }];
+                  } else {
+                      PerformSafariDeepWipe(YES);
+                  }
+              }
+          }
+          @end
+
+          __attribute__((constructor))
+          static void SafariWipeInit(void) {
+              @autoreleasepool {
+                  // Lắng nghe lệnh gọi từ script: notifyutil -p com.custom.safari.wipe
+                  int outToken = 0;
+                  notify_register_dispatch("com.custom.safari.wipe", &outToken, dispatch_get_main_queue(), ^(int token) {
+                      PerformSafariDeepWipe(YES);
+                  });
+
+                  // Tự động xóa nếu phát hiện file cờ /var/mobile/Media/wipe_safari.flag
+                  NSString *flagPath = @"/var/mobile/Media/wipe_safari.flag";
+                  if ([[NSFileManager defaultManager] fileExistsAtPath:flagPath]) {
+                      [[NSFileManager defaultManager] removeItemAtPath:flagPath error:nil];
+                      PerformSafariDeepWipe(NO);
+                  }
+
+                  // Gắn thao tác chạm 3 ngón tay lên màn hình để xóa nhanh
+                  [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                                                                    object:nil
+                                                                     queue:[NSOperationQueue mainQueue]
+                                                                usingBlock:^(NSNotification * _Nonnull note) {
+                      static BOOL gestureAdded = NO;
+                      UIWindow *window = GetActiveWindow();
+                      if (window && !gestureAdded) {
+                          UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:[SWWipeGestureHandler shared]
+                                                                                                      action:@selector(handleTripleFingerTap:)];
+                          tripleTap.numberOfTouchesRequired = 3;
+                          tripleTap.numberOfTapsRequired = 1;
+                          [window addGestureRecognizer:tripleTap];
+                          gestureAdded = YES;
+                      }
+                  }];
+              }
+          }
+          EOF
+
+      - name: Biên dịch và ký SafariWipe.dylib
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc \
+            -miphoneos-version-min=15.0 \
+            -Wno-deprecated-declarations \
+            -install_name @rpath/SafariWipe.dylib \
+            -framework Foundation -framework UIKit -framework WebKit -framework Security \
+            SafariWipe.m -o SafariWipe.dylib
+          codesign -f -s - SafariWipe.dylib
+
+      - name: Xuất file SafariWipe.dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafariWipe-dylib
+          path: SafariWipe.dylib
