@@ -56,6 +56,7 @@ static NSSet<WKWebView *> *GetAllActiveSafariWebViews(void) {
     return all;
 }
 
+// Diệt cả tiến trình WebKit ngầm lẫn tiến trình swcd (SharedWebCredentials giữ trạng thái ẩn Smart App Banner)
 static void KillBackgroundWebKitDaemons(void) {
     const char *killallPaths[] = {
         "/var/jb/usr/bin/killall",
@@ -79,6 +80,7 @@ static void KillBackgroundWebKitDaemons(void) {
             (char *)"com.apple.WebKit.GPU",
             (char *)"SafariViewService",
             (char *)"webbookmarksd",
+            (char *)"swcd",
             NULL
         };
         posix_spawn(&pid, binPath, NULL, NULL, argv, environ);
@@ -101,6 +103,7 @@ static void KillBackgroundWebKitDaemons(void) {
 @property (nonatomic, assign) NSInteger cpuCores;
 @property (nonatomic, assign) NSInteger canvasSeed;
 @property (nonatomic, assign) BOOL isButtonVisible;
+@property (nonatomic, assign) BOOL forceAppBanner;
 @property (nonatomic, assign) BOOL isRecording;
 @property (nonatomic, assign) NSUInteger stepCount;
 @property (nonatomic, copy) NSString *sessionDir;
@@ -130,7 +133,7 @@ static void KillBackgroundWebKitDaemons(void) {
 - (NSString *)profilePath {
     NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
     [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v69.plist"];
+    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v70.plist"];
 }
 
 - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
@@ -163,8 +166,10 @@ static void KillBackgroundWebKitDaemons(void) {
         self.cpuCores = [dict[@"cpuCores"] integerValue] ?: 6;
         self.canvasSeed = [dict[@"canvasSeed"] integerValue] ?: 582913;
         self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
+        self.forceAppBanner = dict[@"forceAppBanner"] ? [dict[@"forceAppBanner"] boolValue] : YES;
     } else {
         self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
+        self.forceAppBanner = dict[@"forceAppBanner"] ? [dict[@"forceAppBanner"] boolValue] : YES;
         [self rotateProfile];
     }
 }
@@ -185,13 +190,13 @@ static void KillBackgroundWebKitDaemons(void) {
         @"carrierMNC": self.carrierMNC ?: @"01",
         @"cpuCores": @(self.cpuCores),
         @"canvasSeed": @(self.canvasSeed),
-        @"isButtonVisible": @(self.isButtonVisible)
+        @"isButtonVisible": @(self.isButtonVisible),
+        @"forceAppBanner": @(self.forceAppBanner)
     };
     [dict writeToFile:[self profilePath] atomically:YES];
 }
 
 - (void)rotateProfile {
-    // Cố định chỉ random từ iOS 16.6 trở lên (Tất cả đều đồng bộ Version/16.6 chuẩn của Apple)
     NSArray<NSArray<NSString *> *> *ios16_6PlusProfiles = @[
         @[@"16_6",    @"16.6", @"16.6"],
         @[@"16_6_1",  @"16.6", @"16.6.1"],
@@ -241,6 +246,7 @@ static void KillBackgroundWebKitDaemons(void) {
     NSTimeZone *parisTZ = [NSTimeZone timeZoneWithName:@"Europe/Paris"];
     NSInteger secondsFromGMT = [parisTZ secondsFromGMTForDate:[NSDate date]];
     NSInteger jsTzOffset = -(secondsFromGMT / 60);
+    NSInteger showBannerFlag = self.forceAppBanner ? 1 : 0;
 
     return [NSString stringWithFormat:
         @"(function() {"
@@ -248,6 +254,7 @@ static void KillBackgroundWebKitDaemons(void) {
         @"    const seed = %ld;"
         @"    const cores = %ld;"
         @"    const tzOffset = %ld;"
+        @"    const forceBanner = %ld;"
         @"    const deltaR = (seed %% 5) + 1;"
         @"    const deltaG = ((seed >> 3) %% 5) + 1;"
         @"    const deltaB = ((seed >> 6) %% 5) + 1;"
@@ -376,9 +383,32 @@ static void KillBackgroundWebKitDaemons(void) {
         @"      } catch(e) {}"
         @"      return rect;"
         @"    });"
+        @"    if (forceBanner === 1 && window === window.top) {"
+        @"      window.addEventListener('load', function() {"
+        @"        try {"
+        @"          if (location.hostname.indexOf('amazon.') === -1) return;"
+        @"          localStorage.removeItem('amz-smart-banner-dismissed');"
+        @"          if (!document.querySelector('meta[name=\"apple-itunes-app\"]')) {"
+        @"            const m = document.createElement('meta');"
+        @"            m.name = 'apple-itunes-app';"
+        @"            m.content = 'app-id=297606951';"
+        @"            if (document.head) document.head.appendChild(m);"
+        @"          }"
+        @"          if (!document.getElementById('nav-smart-app-banner-af')) {"
+        @"            const bar = document.createElement('div');"
+        @"            bar.id = 'nav-smart-app-banner-af';"
+        @"            bar.style.cssText = 'display:flex;align-items:center;justify-content:space-between;background:#f3f4f6;padding:8px 12px;border-bottom:1px solid #d5d9d9;font-family:-apple-system,BlinkMacSystemFont,sans-serif;height:56px;box-sizing:border-box;width:100%%;z-index:9999;';"
+        @"            bar.innerHTML = '<div style=\"display:flex;align-items:center;gap:10px;\"><span style=\"color:#555;font-size:16px;padding-right:2px;\">&times;</span><div style=\"width:38px;height:38px;border-radius:8px;background:#d9b382;display:flex;align-items:center;justify-content:center;font-weight:bold;color:#111;font-size:18px;box-shadow:0 1px 2px rgba(0,0,0,0.15);\">a</div><div style=\"line-height:1.25;\"><div style=\"font-weight:700;font-size:14px;color:#0f1111;\">Fast. Easy.</div><div style=\"font-size:12px;color:#333;\">Shop in our free App today</div></div></div><div style=\"border:1px solid #c7c7c7;background:#fff;border-radius:16px;padding:5px 18px;color:#0066ff;font-weight:700;font-size:14px;\">Open</div>';"
+        @"            if (document.body && document.body.firstChild) {"
+        @"              document.body.insertBefore(bar, document.body.firstChild);"
+        @"            }"
+        @"          }"
+        @"        } catch(e) {}"
+        @"      });"
+        @"    }"
         @"  } catch (err) {}"
         @"})();",
-        (long)self.canvasSeed, (long)self.cpuCores, (long)jsTzOffset];
+        (long)self.canvasSeed, (long)self.cpuCores, (long)jsTzOffset, (long)showBannerFlag];
 }
 
 - (void)injectIntoUserContentController:(WKUserContentController *)ucc {
@@ -736,7 +766,8 @@ static void PurgeSafariDiskStorage(void) {
     NSArray *globalSafariDirs = @[
         @"/var/mobile/Library/Safari",
         @"/var/mobile/Library/WebKit",
-        @"/var/mobile/Library/Caches/com.apple.mobilesafari"
+        @"/var/mobile/Library/Caches/com.apple.mobilesafari",
+        @"/var/mobile/Library/Caches/com.apple.SharedWebCredentials"
     ];
     for (NSString *dir in globalSafariDirs) {
         NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
@@ -747,7 +778,8 @@ static void PurgeSafariDiskStorage(void) {
                 [f containsString:@"SuspendedState"] ||
                 [f containsString:@"CloudTabs"] ||
                 [f containsString:@"Thumbnails"] ||
-                [f containsString:@"History"]) {
+                [f containsString:@"History"] ||
+                [f containsString:@"SharedWebCredentials"]) {
                 [fm removeItemAtPath:[dir stringByAppendingPathComponent:f] error:nil];
             }
         }
@@ -999,7 +1031,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     NSArray<NSString *> *targetCookies = amzCookies.count > 0 ? amzCookies : allCookies;
     NSString *cookieBlock = targetCookies.count > 0 ? [targetCookies componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V6.9 DIAGNOSTIC (iOS 16.6+ ONLY) ===\n"
+        @"=== SAFARI V7.0 DIAGNOSTIC (iOS 16.6+ & BANNER) ===\n"
         @"Time: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
@@ -1033,30 +1065,37 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
 - (void)showMainPanel {
     CollectAllSafariCookies(^(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies) {
         SWSpoofManager *sm = [SWSpoofManager shared];
-        NSString *recStatus = sm.isRecording ? [NSString stringWithFormat:@"ĐANG GHI (%lu bước)", (unsigned long)sm.stepCount] : @"Đang tắt";
+        NSString *bannerState = sm.forceAppBanner ? @"ĐANG BẬT (AutoTouch Ready)" : @"Đang tắt";
         NSString *msg = [NSString stringWithFormat:
             @"• Nhánh UA: iOS %@ (%ld Cores)\n"
             @"• HW Seed (WebGL/Canvas/Rect): #%ld\n"
             @"• Vùng: %@ | %@\n"
             @"• Nhà mạng: %@ (%@-%@)\n"
             @"• Cookie Amazon: %lu | Tổng Cookie: %lu\n"
-            @"• Serial: %@ | Rec: %@\n"
-            @"• IDFV: %@\n\n"
+            @"• Banner Open: %@\n"
+            @"• Serial: %@ | IDFV:\n%@\n\n"
             @"• User-Agent:\n%@",
             sm.iosVersion, (long)sm.cpuCores,
             (long)sm.canvasSeed,
             sm.localeCode, sm.timeZoneName,
             sm.carrierName, sm.carrierMCC, sm.carrierMNC,
             (unsigned long)amzCookies.count, (unsigned long)allCookies.count,
-            sm.serial, recStatus, sm.idfv,
+            bannerState,
+            sm.serial, sm.idfv,
             sm.userAgent];
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.9 (iOS 16.6+)"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.0 (iOS 16.6+ & Banner)"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + Tiến Trình & Đổi Máy (16.6+)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + swcd & Đổi Máy (16.6+)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
             PerformSafariDeepWipeAndRotate(YES);
+        }]];
+
+        NSString *toggleBannerTitle = sm.forceAppBanner ? @"Banner Open: Đang BẬT (Bấm để Tắt)" : @"Banner Open: Đang TẮT (Bấm để Bật)";
+        [alert addAction:[UIAlertAction actionWithTitle:toggleBannerTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            sm.forceAppBanner = !sm.forceAppBanner;
+            [sm saveProfile];
         }]];
 
         [alert addAction:[UIAlertAction actionWithTitle:@"Info: Copy Diagnostic Report" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
@@ -1072,16 +1111,6 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
         [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy Tất Cả (%lu)", (unsigned long)allCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
             if (allCookies.count > 0) {
                 [UIPasteboard generalPasteboard].string = [allCookies componentsJoinedByString:@"; "];
-            }
-        }]];
-
-        NSString *recBtnTitle = sm.isRecording ? @"Stop Rec (Lưu vào Documents/FWAmzSteps)" : @"Rec: Bắt đầu ghi StepRecorder";
-        [alert addAction:[UIAlertAction actionWithTitle:recBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            if (sm.isRecording) {
-                NSString *savedPath = [sm stopRecordingSession];
-                [UIPasteboard generalPasteboard].string = savedPath;
-            } else {
-                [sm startRecordingSession];
             }
         }]];
 
