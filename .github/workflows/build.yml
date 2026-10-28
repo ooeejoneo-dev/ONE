@@ -1,4 +1,4 @@
-name: Build SafariWipe V6.4 Hardware & Process Killer
+name: Build SafariWipe V6.4 Full Suite
 
 on: [push, workflow_dispatch]
 
@@ -7,8 +7,8 @@ jobs:
     runs-on: macos-latest
     steps:
       - name: Create Source File
+        shell: python
         run: |
-          python3 -c '
           code = r"""#import <Foundation/Foundation.h>
           #import <UIKit/UIKit.h>
           #import <WebKit/WebKit.h>
@@ -25,7 +25,6 @@ jobs:
 
           extern char **environ;
 
-          // Hàm diệt các tiến trình WebKit chạy ngầm đang giữ Cookie/Cache trong RAM
           static void KillBackgroundWebKitDaemons(void) {
               const char *killallPaths[] = {
                   "/var/jb/usr/bin/killall",
@@ -538,7 +537,6 @@ jobs:
           static SWFloatingWindow *gOverlayWindow = nil;
           static NSTimer *gCheckTimer = nil;
 
-          // Xóa trực tiếp toàn bộ thư mục lưu vết trên ổ cứng ngay trước khi đóng tiến trình
           static void PurgeSafariDiskStorage(void) {
               NSFileManager *fm = [NSFileManager defaultManager];
               NSString *home = NSHomeDirectory();
@@ -558,7 +556,6 @@ jobs:
                       [fm removeItemAtPath:[full stringByAppendingPathComponent:item] error:nil];
                   }
               }
-              // Xóa thêm thư mục Cookies chia sẻ ngoài Sandbox nếu quyền cho phép
               NSArray *sharedCookieFiles = [fm contentsOfDirectoryAtPath:@"/var/mobile/Library/Cookies" error:nil];
               for (NSString *f in sharedCookieFiles) {
                   if ([f containsString:@"Cookies"] || [f containsString:@"safari"]) {
@@ -568,15 +565,11 @@ jobs:
           }
 
           static void FinalizeHardExit(BOOL shouldExitAfterWipe) {
-              // Xoay sang bộ thông số phần cứng & User-Agent mới
               [[SWSpoofManager shared] rotateProfile];
-              // Xóa lần cuối toàn bộ file trên đĩa để chặn việc WebKit ghi đè lúc đang xóa
               PurgeSafariDiskStorage();
-              // Diệt toàn bộ tiến trình con của WebKit đang giữ cache trong RAM
               KillBackgroundWebKitDaemons();
 
               if (shouldExitAfterWipe) {
-                  // Dùng _exit(0) để đóng tức khắc ở tầng Kernel, chặn Safari lưu lại Tab cũ vào BrowserState.db
                   _exit(0);
               }
           }
@@ -589,7 +582,6 @@ jobs:
                       gOverlayWindow.fabButton.userInteractionEnabled = NO;
                   }
 
-                  // 1. Xóa sạch Keychain của Safari
                   NSArray *secClasses = @[
                       (__bridge id)kSecClassGenericPassword,
                       (__bridge id)kSecClassInternetPassword,
@@ -604,26 +596,22 @@ jobs:
                       SecItemDelete((__bridge CFDictionaryRef)q2);
                   }
 
-                  // 2. Xóa NSHTTPCookieStorage & NSURLCache
                   NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                   for (NSHTTPCookie *c in [cs cookies]) { [cs deleteCookie:c]; }
                   [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
-                  // 3. Xóa NSUserDefaults
                   NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
                   if (bid) {
                       [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
                       [[NSUserDefaults standardUserDefaults] synchronize];
                   }
 
-                  // Bộ hẹn giờ bảo hiểm: Nếu tiến trình WebKit ngầm bị treo quá 1.5s thì vẫn ép diệt daemon và thoát
                   if (shouldExitAfterWipe) {
                       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                           FinalizeHardExit(YES);
                       });
                   }
 
-                  // 4. Xóa sạch WKHTTPCookieStore và WKWebsiteDataStore rồi mới diệt tiến trình ngầm
                   WKWebsiteDataStore *dataStore = [WKWebsiteDataStore defaultDataStore];
                   WKHTTPCookieStore *wkCookieStore = dataStore.httpCookieStore;
                   [wkCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *wkCookies) {
@@ -824,19 +812,22 @@ jobs:
 
                   dispatch_async(dispatch_get_main_queue(), ^{
                       SWSpoofManager *sm = [SWSpoofManager shared];
+                      NSString *recStatus = sm.isRecording ? [NSString stringWithFormat:@"ĐANG GHI (%lu bước)", (unsigned long)sm.stepCount] : @"Đang tắt";
                       NSString *msg = [NSString stringWithFormat:
                           @"• Nhánh UA: iOS %@ (%ld Cores)\n"
                           @"• HW Seed (WebGL/Canvas/Rect): #%ld\n"
                           @"• Vùng: %@ | %@\n"
                           @"• Nhà mạng: %@ (%@-%@)\n"
                           @"• Serial: %@ | Cookie: %lu\n"
+                          @"• Rec: %@\n"
                           @"• IDFV: %@\n\n"
                           @"• User-Agent:\n%@",
                           sm.iosVersion, (long)sm.cpuCores,
                           (long)sm.canvasSeed,
                           sm.localeCode, sm.timeZoneName,
                           sm.carrierName, sm.carrierMCC, sm.carrierMNC,
-                          sm.serial, (unsigned long)amzCookies.count, sm.idfv,
+                          sm.serial, (unsigned long)amzCookies.count,
+                          recStatus, sm.idfv,
                           sm.userAgent];
 
                       UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.4 (Full Kill)"
@@ -854,6 +845,16 @@ jobs:
                       [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy All (%lu)", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                           if (amzCookies.count > 0) {
                               [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
+                          }
+                      }]];
+
+                      NSString *recBtnTitle = sm.isRecording ? @"Stop Rec (Lưu vào Documents/FWAmzSteps)" : @"Rec: Bắt đầu ghi StepRecorder";
+                      [alert addAction:[UIAlertAction actionWithTitle:recBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                          if (sm.isRecording) {
+                              NSString *savedPath = [sm stopRecordingSession];
+                              [UIPasteboard generalPasteboard].string = savedPath;
+                          } else {
+                              [sm startRecordingSession];
                           }
                       }]];
 
@@ -908,22 +909,16 @@ jobs:
               }
           }
           """
-          open("SafariWipe.m", "w").write(code)
-          '
+          with open("SafariWipe.m", "w", encoding="utf-8") as f:
+              f.write(code.strip() + "\n")
 
-      - name: Compile and Package DEB
+      - name: Create Packaging Files
+        shell: python
         run: |
-          brew install ldid dpkg
-          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 -Wno-deprecated-declarations -install_name @rpath/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics -framework CoreTelephony SafariWipe.m -o SafariWipe.dylib
-          ldid -S SafariWipe.dylib
+          import os
+          os.makedirs("pkg/DEBIAN", exist_ok=True)
+          os.makedirs("pkg/Library/MobileSubstrate/DynamicLibraries", exist_ok=True)
 
-          mkdir -p pkg/DEBIAN
-          mkdir -p pkg/Library/MobileSubstrate/DynamicLibraries
-          cp SafariWipe.dylib pkg/Library/MobileSubstrate/DynamicLibraries/
-          chmod 0755 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.dylib
-
-          python3 -c '
           plist = """<?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
           <plist version="1.0">
@@ -937,7 +932,9 @@ jobs:
             </dict>
           </dict>
           </plist>"""
-          open("pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist", "w").write(plist)
+          with open("pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist", "w", encoding="utf-8") as f:
+              f.write(plist.strip() + "\n")
+
           control = """Package: com.custom.safariwipe
           Name: SafariWipe V6.4 Full Kill
           Version: 6.4.0
@@ -948,8 +945,17 @@ jobs:
           Section: Tweaks
           Depends: mobilesubstrate
           """
-          open("pkg/DEBIAN/control", "w").write(control)
-          '
+          with open("pkg/DEBIAN/control", "w", encoding="utf-8") as f:
+              f.write(control.strip() + "\n")
+
+      - name: Compile and Package DEB
+        run: |
+          brew install ldid dpkg
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 -Wno-deprecated-declarations -install_name @rpath/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics -framework CoreTelephony SafariWipe.m -o SafariWipe.dylib
+          ldid -S SafariWipe.dylib
+          cp SafariWipe.dylib pkg/Library/MobileSubstrate/DynamicLibraries/
+          chmod 0755 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.dylib
           chmod 0644 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist
           dpkg-deb -Zgzip -b pkg SafariWipe.deb
 
