@@ -89,7 +89,7 @@ static void KillBackgroundWebKitDaemons(void) {
 - (NSString *)profilePath {
     NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
     [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v65.plist"];
+    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v66.plist"];
 }
 
 - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
@@ -205,10 +205,9 @@ static void KillBackgroundWebKitDaemons(void) {
     NSInteger secondsFromGMT = [parisTZ secondsFromGMTForDate:[NSDate date]];
     NSInteger jsTzOffset = -(secondsFromGMT / 60);
 
+    // Zero-Footprint IIFE: Không gắn bất kỳ biến hay thuộc tính nào lên window hoặc Array
     return [NSString stringWithFormat:
         @"(function() {"
-        @"  if (window.__sw_v65_injected) return;"
-        @"  window.__sw_v65_injected = true;"
         @"  try {"
         @"    const seed = %ld;"
         @"    const cores = %ld;"
@@ -218,6 +217,7 @@ static void KillBackgroundWebKitDaemons(void) {
         @"    const deltaB = ((seed >> 6) %% 5) + 1;"
         @"    const nativeToString = Function.prototype.toString;"
         @"    const maskedFns = new WeakMap();"
+        @"    const noisedBuffers = new WeakSet();"
         @"    const toStrProxy = new Proxy(nativeToString, {"
         @"      apply(target, thisArg, args) {"
         @"        if (maskedFns.has(thisArg)) return maskedFns.get(thisArg);"
@@ -321,10 +321,10 @@ static void KillBackgroundWebKitDaemons(void) {
         @"      maskMethod(AudioBuffer.prototype, 'getChannelData', (target, thisArg, args) => {"
         @"        const ch = Reflect.apply(target, thisArg, args);"
         @"        try {"
-        @"          if (ch && ch.length > 10 && !ch._swNoised) {"
+        @"          if (ch && ch.length > 10 && !noisedBuffers.has(ch)) {"
+        @"            noisedBuffers.add(ch);"
         @"            const offset = ((seed %% 9) + 1) * 1e-7;"
         @"            for (let i = 0; i < ch.length; i += 64) { ch[i] += offset; }"
-        @"            Object.defineProperty(ch, '_swNoised', { value: true, enumerable: false });"
         @"          }"
         @"        } catch(e) {}"
         @"        return ch;"
@@ -347,6 +347,12 @@ static void KillBackgroundWebKitDaemons(void) {
 
 - (void)injectIntoUserContentController:(WKUserContentController *)ucc {
     if (!ucc) return;
+    // Kiểm tra ở tầng Objective-C để không bao giờ nạp trùng WKUserScript
+    for (WKUserScript *existing in ucc.userScripts) {
+        if ([existing.source containsString:@"Europe/Paris"]) {
+            return;
+        }
+    }
     NSString *jsCode = [self buildEnvironmentJS];
     WKUserScript *envScript = [[WKUserScript alloc] initWithSource:jsCode
                                                      injectionTime:WKUserScriptInjectionTimeAtDocumentStart
@@ -441,7 +447,6 @@ static void swizzled_WKWebView_setCustomUA(WKWebView *self, SEL _cmd, NSString *
 
 static WKNavigation* swizzled_WKWebView_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *request) {
     [[SWSpoofManager shared] injectIntoUserContentController:self.configuration.userContentController];
-    [self evaluateJavaScript:[[SWSpoofManager shared] buildEnvironmentJS] completionHandler:nil];
     if ([SWSpoofManager shared].isRecording && request.URL.absoluteString) {
         [[SWSpoofManager shared] recordStepWithType:@"WEB_NAV" url:request.URL.absoluteString];
     }
@@ -851,7 +856,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
 
     NSString *cookieBlock = cookiePairs.count > 0 ? [cookiePairs componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V6.5 DIAGNOSTIC ===\n"
+        @"=== SAFARI V6.6 DIAGNOSTIC (ZERO-FOOTPRINT JS) ===\n"
         @"Time: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
@@ -910,7 +915,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
                 recStatus, sm.idfv,
                 sm.userAgent];
 
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.5 (Tab & Canvas Fix)"
+            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.6 (Zero-Footprint)"
                                                                            message:msg
                                                                     preferredStyle:UIAlertControllerStyleAlert];
 
