@@ -1,4 +1,4 @@
-name: Build SafariWipe V6.5 Tab & Canvas Fix
+name: Build SafariWipe V6.5
 
 on: [push, workflow_dispatch]
 
@@ -6,370 +6,60 @@ jobs:
   build:
     runs-on: macos-latest
     steps:
-      - name: Create Source File
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Create Packaging Files
         shell: python
         run: |
-          code = r"""#import <Foundation/Foundation.h>
-          #import <UIKit/UIKit.h>
-          #import <WebKit/WebKit.h>
-          #import <Security/Security.h>
-          #import <QuartzCore/QuartzCore.h>
-          #import <CoreGraphics/CoreGraphics.h>
-          #import <CoreTelephony/CTCarrier.h>
-          #import <objc/runtime.h>
-          #import <objc/message.h>
-          #import <notify.h>
-          #import <spawn.h>
-          #import <signal.h>
-          #import <unistd.h>
-          #import <stdlib.h>
+          import os
+          os.makedirs("pkg/DEBIAN", exist_ok=True)
+          os.makedirs("pkg/Library/MobileSubstrate/DynamicLibraries", exist_ok=True)
 
-          extern char **environ;
+          plist = """<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Bundles</key>
+              <array>
+                <string>com.apple.mobilesafari</string>
+              </array>
+            </dict>
+          </dict>
+          </plist>"""
+          with open("pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist", "w", encoding="utf-8") as f:
+              f.write(plist.strip() + "\n")
 
-          static void KillBackgroundWebKitDaemons(void) {
-              const char *killallPaths[] = {
-                  "/var/jb/usr/bin/killall",
-                  "/usr/bin/killall",
-                  NULL
-              };
-              const char *binPath = NULL;
-              for (int i = 0; killallPaths[i] != NULL; i++) {
-                  if (access(killallPaths[i], X_OK) == 0) {
-                      binPath = killallPaths[i];
-                      break;
-                  }
-              }
-              if (binPath) {
-                  pid_t pid = 0;
-                  char *argv[] = {
-                      (char *)"killall",
-                      (char *)"-9",
-                      (char *)"com.apple.WebKit.Networking",
-                      (char *)"com.apple.WebKit.WebContent",
-                      (char *)"com.apple.WebKit.GPU",
-                      (char *)"SafariViewService",
-                      (char *)"webbookmarksd",
-                      NULL
-                  };
-                  posix_spawn(&pid, binPath, NULL, NULL, argv, environ);
-              }
-          }
+          control = """Package: com.custom.safariwipe
+          Name: SafariWipe V6.5 Tab & Canvas Fix
+          Version: 6.5.0
+          Architecture: iphoneos-arm
+          Description: Safari Data Management Utility
+          Maintainer: Custom
+          Author: Custom
+          Section: Tweaks
+          Depends: mobilesubstrate
+          """
+          with open("pkg/DEBIAN/control", "w", encoding="utf-8") as f:
+              f.write(control.strip() + "\n")
 
-          @interface SWSpoofManager : NSObject
-          @property (nonatomic, copy) NSString *userAgent;
-          @property (nonatomic, copy) NSString *iosVersion;
-          @property (nonatomic, copy) NSString *idfv;
-          @property (nonatomic, copy) NSString *idfa;
-          @property (nonatomic, copy) NSString *serial;
-          @property (nonatomic, copy) NSString *installId;
-          @property (nonatomic, copy) NSString *localeCode;
-          @property (nonatomic, copy) NSString *timeZoneName;
-          @property (nonatomic, copy) NSString *carrierName;
-          @property (nonatomic, copy) NSString *carrierISO;
-          @property (nonatomic, copy) NSString *carrierMCC;
-          @property (nonatomic, copy) NSString *carrierMNC;
-          @property (nonatomic, assign) NSInteger cpuCores;
-          @property (nonatomic, assign) NSInteger canvasSeed;
-          @property (nonatomic, assign) BOOL isButtonVisible;
-          @property (nonatomic, assign) BOOL isRecording;
-          @property (nonatomic, assign) NSUInteger stepCount;
-          @property (nonatomic, copy) NSString *sessionDir;
+      - name: Compile and Package DEB
+        run: |
+          brew install ldid dpkg
+          SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 -Wno-deprecated-declarations -install_name @rpath/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics -framework CoreTelephony SafariWipe.m -o SafariWipe.dylib
+          ldid -S SafariWipe.dylib
+          cp SafariWipe.dylib pkg/Library/MobileSubstrate/DynamicLibraries/
+          chmod 0755 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.dylib
+          chmod 0644 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist
+          dpkg-deb -Zgzip -b pkg SafariWipe.deb
 
-          + (instancetype)shared;
-          - (void)rotateProfile;
-          - (void)saveProfile;
-          - (NSString *)buildEnvironmentJS;
-          - (void)injectIntoUserContentController:(WKUserContentController *)ucc;
-          - (void)startRecordingSession;
-          - (NSString *)stopRecordingSession;
-          - (void)recordStepWithType:(NSString *)type url:(NSString *)url;
-          @end
-
-          @implementation SWSpoofManager
-
-          + (instancetype)shared {
-              static SWSpoofManager *inst = nil;
-              static dispatch_once_t onceToken;
-              dispatch_once(&onceToken, ^{
-                  inst = [[self alloc] init];
-                  [inst loadOrGenerateProfile];
-              });
-              return inst;
-          }
-
-          - (NSString *)profilePath {
-              NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
-              [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-              return [docDir stringByAppendingPathComponent:@".safari_amzfr_v65.plist"];
-          }
-
-          - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
-              NSMutableString *s = [NSMutableString stringWithCapacity:len];
-              for (NSUInteger i = 0; i < len; i++) {
-                  uint32_t idx = arc4random_uniform((uint32_t)chars.length);
-                  [s appendFormat:@"%C", [chars characterAtIndex:idx]];
-              }
-              return s;
-          }
-
-          - (void)loadOrGenerateProfile {
-              NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:[self profilePath]];
-              if (dict && dict[@"userAgent"] && dict[@"idfv"]) {
-                  self.userAgent = dict[@"userAgent"];
-                  self.iosVersion = dict[@"iosVersion"] ?: @"26.0";
-                  self.idfv = dict[@"idfv"];
-                  self.idfa = dict[@"idfa"] ?: [[NSUUID UUID] UUIDString];
-                  self.serial = dict[@"serial"] ?: [self randomStringWithChars:@"ABCDEFGHJKLMNPQRSTUVWXYZ0123456789" length:12];
-                  self.installId = dict[@"installId"] ?: [[NSUUID UUID] UUIDString];
-                  self.localeCode = dict[@"localeCode"] ?: @"fr_FR";
-                  self.timeZoneName = dict[@"timeZoneName"] ?: @"Europe/Paris";
-                  self.carrierName = dict[@"carrierName"] ?: @"Orange F";
-                  self.carrierISO = dict[@"carrierISO"] ?: @"fr";
-                  self.carrierMCC = dict[@"carrierMCC"] ?: @"208";
-                  self.carrierMNC = dict[@"carrierMNC"] ?: @"01";
-                  self.cpuCores = [dict[@"cpuCores"] integerValue] ?: 6;
-                  self.canvasSeed = [dict[@"canvasSeed"] integerValue] ?: 582913;
-                  self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
-              } else {
-                  self.isButtonVisible = YES;
-                  [self rotateProfile];
-              }
-          }
-
-          - (void)saveProfile {
-              NSDictionary *dict = @{
-                  @"userAgent": self.userAgent ?: @"",
-                  @"iosVersion": self.iosVersion ?: @"26.0",
-                  @"idfv": self.idfv ?: [[NSUUID UUID] UUIDString],
-                  @"idfa": self.idfa ?: [[NSUUID UUID] UUIDString],
-                  @"serial": self.serial ?: @"",
-                  @"installId": self.installId ?: @"",
-                  @"localeCode": self.localeCode ?: @"fr_FR",
-                  @"timeZoneName": self.timeZoneName ?: @"Europe/Paris",
-                  @"carrierName": self.carrierName ?: @"Orange F",
-                  @"carrierISO": self.carrierISO ?: @"fr",
-                  @"carrierMCC": self.carrierMCC ?: @"208",
-                  @"carrierMNC": self.carrierMNC ?: @"01",
-                  @"cpuCores": @(self.cpuCores),
-                  @"canvasSeed": @(self.canvasSeed),
-                  @"isButtonVisible": @(self.isButtonVisible)
-              };
-              [dict writeToFile:[self profilePath] atomically:YES];
-          }
-
-          - (void)rotateProfile {
-              NSArray<NSArray<NSString *> *> *ios16Profiles = @[
-                  @[@"16_5",    @"16.5", @"16.5"],
-                  @[@"16_6",    @"16.6", @"16.6"],
-                  @[@"16_6_1",  @"16.6", @"16.6.1"],
-                  @[@"16_7_8",  @"16.6", @"16.7.8"],
-                  @[@"16_7_10", @"16.6", @"16.7.10"],
-                  @[@"16_7_16", @"16.6", @"16.7.16"]
-              ];
-
-              NSArray<NSArray<NSString *> *> *ios26Profiles = @[
-                  @[@"18_6",   @"26.0", @"26.0"],
-                  @[@"18_6",   @"26.1", @"26.1"],
-                  @[@"18_6",   @"26.2", @"26.2"],
-                  @[@"26_0",   @"26.0", @"26.0"],
-                  @[@"26_0_1", @"26.0", @"26.0.1"],
-                  @[@"26_1",   @"26.1", @"26.1"],
-                  @[@"26_2",   @"26.2", @"26.2"],
-                  @[@"26_3",   @"26.3", @"26.3"]
-              ];
-
-              BOOL pickIOS26 = (arc4random_uniform(2) == 1);
-              NSArray<NSArray<NSString *> *> *pool = pickIOS26 ? ios26Profiles : ios16Profiles;
-              NSArray<NSString *> *picked = pool[arc4random_uniform((uint32_t)pool.count)];
-
-              NSArray<NSArray<NSString *> *> *frCarriers = @[
-                  @[@"Orange F",         @"fr", @"208", @"01"],
-                  @[@"SFR",              @"fr", @"208", @"10"],
-                  @[@"Bouygues Telecom", @"fr", @"208", @"20"],
-                  @[@"Free",             @"fr", @"208", @"15"]
-              ];
-              NSArray<NSString *> *cPicked = frCarriers[arc4random_uniform((uint32_t)frCarriers.count)];
-
-              self.iosVersion = picked[2];
-              self.userAgent = [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1", picked[0], picked[1]];
-              self.idfv = [[NSUUID UUID] UUIDString];
-              self.idfa = [[NSUUID UUID] UUIDString];
-              self.serial = [self randomStringWithChars:@"ABCDEFGHJKLMNPQRSTUVWXYZ0123456789" length:12];
-              self.installId = [[NSUUID UUID] UUIDString];
-              self.localeCode = @"fr_FR";
-              self.timeZoneName = @"Europe/Paris";
-              self.carrierName = cPicked[0];
-              self.carrierISO = cPicked[1];
-              self.carrierMCC = cPicked[2];
-              self.carrierMNC = cPicked[3];
-              self.cpuCores = (arc4random_uniform(2) == 0) ? 6 : 4;
-              // Đảm bảo seed mới không bao giờ trùng với seed cũ
-              NSInteger newSeed = (NSInteger)(arc4random_uniform(899999) + 100000);
-              if (newSeed == self.canvasSeed) newSeed += 7;
-              self.canvasSeed = newSeed;
-
-              [self saveProfile];
-          }
-
-          - (NSString *)buildEnvironmentJS {
-              NSTimeZone *parisTZ = [NSTimeZone timeZoneWithName:@"Europe/Paris"];
-              NSInteger secondsFromGMT = [parisTZ secondsFromGMTForDate:[NSDate date]];
-              NSInteger jsTzOffset = -(secondsFromGMT / 60);
-
-              return [NSString stringWithFormat:
-                  @"(function() {"
-                  @"  if (window.__sw_v65_injected) return;"
-                  @"  window.__sw_v65_injected = true;"
-                  @"  try {"
-                  @"    const seed = %ld;"
-                  @"    const cores = %ld;"
-                  @"    const tzOffset = %ld;"
-                  @"    const deltaR = (seed %% 5) + 1;"
-                  @"    const deltaG = ((seed >> 3) %% 5) + 1;"
-                  @"    const deltaB = ((seed >> 6) %% 5) + 1;"
-                  @"    const nativeToString = Function.prototype.toString;"
-                  @"    const maskedFns = new WeakMap();"
-                  @"    const toStrProxy = new Proxy(nativeToString, {"
-                  @"      apply(target, thisArg, args) {"
-                  @"        if (maskedFns.has(thisArg)) return maskedFns.get(thisArg);"
-                  @"        return Reflect.apply(target, thisArg, args);"
-                  @"      }"
-                  @"    });"
-                  @"    maskedFns.set(toStrProxy, 'function toString() { [native code] }');"
-                  @"    Function.prototype.toString = toStrProxy;"
-                  @"    function maskGetter(proto, prop, valFn) {"
-                  @"      if (!proto) return;"
-                  @"      const desc = Object.getOwnPropertyDescriptor(proto, prop);"
-                  @"      if (!desc) return;"
-                  @"      const getter = new Proxy(desc.get || function(){}, {"
-                  @"        apply() { return valFn(); }"
-                  @"      });"
-                  @"      maskedFns.set(getter, 'function get ' + prop + '() { [native code] }');"
-                  @"      Object.defineProperty(proto, prop, { get: getter, enumerable: desc.enumerable, configurable: desc.configurable });"
-                  @"    }"
-                  @"    function maskMethod(proto, name, applyFn) {"
-                  @"      if (!proto) return;"
-                  @"      const orig = proto[name];"
-                  @"      if (typeof orig !== 'function') return;"
-                  @"      const proxied = new Proxy(orig, { apply: applyFn });"
-                  @"      maskedFns.set(proxied, 'function ' + name + '() { [native code] }');"
-                  @"      proto[name] = proxied;"
-                  @"    }"
-                  @"    maskGetter(Navigator.prototype, 'language', () => 'fr-FR');"
-                  @"    maskGetter(Navigator.prototype, 'languages', () => ['fr-FR', 'fr']);"
-                  @"    maskGetter(Navigator.prototype, 'hardwareConcurrency', () => cores);"
-                  @"    maskMethod(Date.prototype, 'getTimezoneOffset', () => tzOffset);"
-                  @"    maskMethod(Intl.DateTimeFormat.prototype, 'resolvedOptions', (target, thisArg, args) => {"
-                  @"      const res = Reflect.apply(target, thisArg, args);"
-                  @"      res.timeZone = 'Europe/Paris';"
-                  @"      if (!res.locale || res.locale.indexOf('fr') !== 0) res.locale = 'fr-FR';"
-                  @"      return res;"
-                  @"    });"
-                  @"    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;"
-                  @"    const origPutImageData = CanvasRenderingContext2D.prototype.putImageData;"
-                  @"    function applyPixelNoise(data) {"
-                  @"      if (!data || data.length < 64) return;"
-                  @"      let changed = 0;"
-                  @"      const start = ((seed %% 13) * 4);"
-                  @"      for (let i = start; i < data.length - 4; i += 36) {"
-                  @"        if (data[i + 3] > 32) {"
-                  @"          data[i]     = (data[i] > 245)     ? (data[i] - deltaR)     : (data[i] + deltaR);"
-                  @"          data[i + 1] = (data[i + 1] > 245) ? (data[i + 1] - deltaG) : (data[i + 1] + deltaG);"
-                  @"          data[i + 2] = (data[i + 2] > 245) ? (data[i + 2] - deltaB) : (data[i + 2] + deltaB);"
-                  @"          changed++;"
-                  @"          if (changed >= 12) break;"
-                  @"        }"
-                  @"      }"
-                  @"      if (changed === 0) {"
-                  @"        const mid = Math.floor(data.length / 8) * 4;"
-                  @"        data[mid]     = (data[mid] + deltaR) & 255;"
-                  @"        data[mid + 1] = (data[mid + 1] + deltaG) & 255;"
-                  @"        data[mid + 3] = (data[mid + 3] === 0) ? deltaB : data[mid + 3];"
-                  @"      }"
-                  @"    }"
-                  @"    maskMethod(CanvasRenderingContext2D.prototype, 'getImageData', (target, thisArg, args) => {"
-                  @"      const img = Reflect.apply(target, thisArg, args);"
-                  @"      try { applyPixelNoise(img.data); } catch(e) {}"
-                  @"      return img;"
-                  @"    });"
-                  @"    function injectCanvas2DNoise(canvas) {"
-                  @"      try {"
-                  @"        const ctx2d = canvas.getContext('2d');"
-                  @"        if (ctx2d && canvas.width >= 2 && canvas.height >= 2) {"
-                  @"          const w = Math.min(canvas.width, 64);"
-                  @"          const h = Math.min(canvas.height, 32);"
-                  @"          const img = Reflect.apply(origGetImageData, ctx2d, [0, 0, w, h]);"
-                  @"          applyPixelNoise(img.data);"
-                  @"          Reflect.apply(origPutImageData, ctx2d, [img, 0, 0]);"
-                  @"        }"
-                  @"      } catch(e) {}"
-                  @"    }"
-                  @"    maskMethod(HTMLCanvasElement.prototype, 'toDataURL', (target, thisArg, args) => {"
-                  @"      injectCanvas2DNoise(thisArg);"
-                  @"      return Reflect.apply(target, thisArg, args);"
-                  @"    });"
-                  @"    maskMethod(HTMLCanvasElement.prototype, 'toBlob', (target, thisArg, args) => {"
-                  @"      injectCanvas2DNoise(thisArg);"
-                  @"      return Reflect.apply(target, thisArg, args);"
-                  @"    });"
-                  @"    function noiseWebGLPixels(target, thisArg, args) {"
-                  @"      const res = Reflect.apply(target, thisArg, args);"
-                  @"      try {"
-                  @"        const pixels = args[6];"
-                  @"        if (pixels && pixels.length >= 64) {"
-                  @"          applyPixelNoise(pixels);"
-                  @"        }"
-                  @"      } catch(e) {}"
-                  @"      return res;"
-                  @"    }"
-                  @"    if (typeof WebGLRenderingContext !== 'undefined') {"
-                  @"      maskMethod(WebGLRenderingContext.prototype, 'readPixels', noiseWebGLPixels);"
-                  @"    }"
-                  @"    if (typeof WebGL2RenderingContext !== 'undefined') {"
-                  @"      maskMethod(WebGL2RenderingContext.prototype, 'readPixels', noiseWebGLPixels);"
-                  @"    }"
-                  @"    if (typeof AudioBuffer !== 'undefined') {"
-                  @"      maskMethod(AudioBuffer.prototype, 'getChannelData', (target, thisArg, args) => {"
-                  @"        const ch = Reflect.apply(target, thisArg, args);"
-                  @"        try {"
-                  @"          if (ch && ch.length > 10 && !ch._swNoised) {"
-                  @"            const offset = ((seed %% 9) + 1) * 1e-7;"
-                  @"            for (let i = 0; i < ch.length; i += 64) { ch[i] += offset; }"
-                  @"            Object.defineProperty(ch, '_swNoised', { value: true, enumerable: false });"
-                  @"          }"
-                  @"        } catch(e) {}"
-                  @"        return ch;"
-                  @"      });"
-                  @"    }"
-                  @"    const rectJitter = ((seed %% 11) + 1) * 1e-6;"
-                  @"    maskMethod(Element.prototype, 'getBoundingClientRect', (target, thisArg, args) => {"
-                  @"      const rect = Reflect.apply(target, thisArg, args);"
-                  @"      try {"
-                  @"        if (rect && rect.width > 0 && rect.height > 0) {"
-                  @"          return new DOMRect(rect.x + rectJitter, rect.y, rect.width + rectJitter, rect.height);"
-                  @"        }"
-                  @"      } catch(e) {}"
-                  @"      return rect;"
-                  @"    });"
-                  @"  } catch (err) {}"
-                  @"})();",
-                  (long)self.canvasSeed, (long)self.cpuCores, (long)jsTzOffset];
-          }
-
-          - (void)injectIntoUserContentController:(WKUserContentController *)ucc {
-              if (!ucc) return;
-              NSString *jsCode = [self buildEnvironmentJS];
-              WKUserScript *envScript = [[WKUserScript alloc] initWithSource:jsCode
-                                                               injectionTime:WKUserScriptInjectionTimeAtDocumentStart
-                                                            forMainFrameOnly:NO];
-              [ucc addUserScript:envScript];
-          }
-
-          - (void)startRecordingSession {
-              NSDateFormatter *df = [[NSDateFormatter alloc] init];
-              df.dateFormat = @"yyyyMMdd_HHmmss";
-              NSString *folderName = [NSString stringWithFormat:@"session_%@", [df stringFromDate:[NSDate date]]];
-              NSString *baseDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/FWAmzSteps"] stringByAppendingPathComponent:folderName];
-              [[NSFileManager defaultManager] createDirectoryAtPath:baseDir withIntermediateDirectories:YES attributes:nil error:nil];
-              self.sessionDir = baseDir;
-              self.step
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafariWipe-V6.5-Package
+          path: |
+            SafariWipe.deb
+            SafariWipe.dylib
