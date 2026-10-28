@@ -1,4 +1,4 @@
-name: Build SafariWipe Visible Button iOS 16 & 26
+name: Build SafariWipe V6.4 Hardware & Process Killer
 
 on: [push, workflow_dispatch]
 
@@ -18,7 +18,41 @@ jobs:
           #import <CoreTelephony/CTCarrier.h>
           #import <objc/runtime.h>
           #import <notify.h>
+          #import <spawn.h>
+          #import <signal.h>
+          #import <unistd.h>
           #import <stdlib.h>
+
+          extern char **environ;
+
+          // Hàm diệt các tiến trình WebKit chạy ngầm đang giữ Cookie/Cache trong RAM
+          static void KillBackgroundWebKitDaemons(void) {
+              const char *killallPaths[] = {
+                  "/var/jb/usr/bin/killall",
+                  "/usr/bin/killall",
+                  NULL
+              };
+              const char *binPath = NULL;
+              for (int i = 0; killallPaths[i] != NULL; i++) {
+                  if (access(killallPaths[i], X_OK) == 0) {
+                      binPath = killallPaths[i];
+                      break;
+                  }
+              }
+              if (binPath) {
+                  pid_t pid = 0;
+                  char *argv[] = {
+                      (char *)"killall",
+                      (char *)"-9",
+                      (char *)"com.apple.WebKit.Networking",
+                      (char *)"com.apple.WebKit.WebContent",
+                      (char *)"com.apple.WebKit.GPU",
+                      (char *)"SafariViewService",
+                      NULL
+                  };
+                  posix_spawn(&pid, binPath, NULL, NULL, argv, environ);
+              }
+          }
 
           @interface SWSpoofManager : NSObject
           @property (nonatomic, copy) NSString *userAgent;
@@ -34,6 +68,7 @@ jobs:
           @property (nonatomic, copy) NSString *carrierMCC;
           @property (nonatomic, copy) NSString *carrierMNC;
           @property (nonatomic, assign) NSInteger cpuCores;
+          @property (nonatomic, assign) NSInteger canvasSeed;
           @property (nonatomic, assign) BOOL isButtonVisible;
           @property (nonatomic, assign) BOOL isRecording;
           @property (nonatomic, assign) NSUInteger stepCount;
@@ -63,7 +98,7 @@ jobs:
           - (NSString *)profilePath {
               NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
               [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-              return [docDir stringByAppendingPathComponent:@".safari_amzfr_visible.plist"];
+              return [docDir stringByAppendingPathComponent:@".safari_amzfr_v64.plist"];
           }
 
           - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
@@ -91,9 +126,10 @@ jobs:
                   self.carrierMCC = dict[@"carrierMCC"] ?: @"208";
                   self.carrierMNC = dict[@"carrierMNC"] ?: @"01";
                   self.cpuCores = [dict[@"cpuCores"] integerValue] ?: 6;
+                  self.canvasSeed = [dict[@"canvasSeed"] integerValue] ?: 582913;
                   self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
               } else {
-                  self.isButtonVisible = YES; // Mặc định LUÔN HIỆN NÚT WIPE
+                  self.isButtonVisible = YES;
                   [self rotateProfile];
               }
           }
@@ -113,13 +149,13 @@ jobs:
                   @"carrierMCC": self.carrierMCC ?: @"208",
                   @"carrierMNC": self.carrierMNC ?: @"01",
                   @"cpuCores": @(self.cpuCores),
+                  @"canvasSeed": @(self.canvasSeed),
                   @"isButtonVisible": @(self.isButtonVisible)
               };
               [dict writeToFile:[self profilePath] atomically:YES];
           }
 
           - (void)rotateProfile {
-              // Random tỷ lệ 50/50 giữa nhánh iOS 16 và nhánh iOS 26
               NSArray<NSArray<NSString *> *> *ios16Profiles = @[
                   @[@"16_5",    @"16.5", @"16.5"],
                   @[@"16_6",    @"16.6", @"16.6"],
@@ -165,6 +201,7 @@ jobs:
               self.carrierMCC = cPicked[2];
               self.carrierMNC = cPicked[3];
               self.cpuCores = (arc4random_uniform(2) == 0) ? 6 : 4;
+              self.canvasSeed = (NSInteger)(arc4random_uniform(899999) + 100000);
 
               [self saveProfile];
           }
@@ -177,22 +214,130 @@ jobs:
               return [NSString stringWithFormat:
                   @"(function() {"
                   @"  try {"
+                  @"    const seed = %ld;"
                   @"    const cores = %ld;"
                   @"    const tzOffset = %ld;"
-                  @"    Object.defineProperty(Navigator.prototype, 'language', { get: () => 'fr-FR', enumerable: true, configurable: true });"
-                  @"    Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['fr-FR', 'fr'], enumerable: true, configurable: true });"
-                  @"    Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => cores, enumerable: true, configurable: true });"
-                  @"    Date.prototype.getTimezoneOffset = function() { return tzOffset; };"
-                  @"    const origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;"
-                  @"    Intl.DateTimeFormat.prototype.resolvedOptions = function() {"
-                  @"      const res = origResolved.apply(this, arguments);"
+                  @"    const nativeToString = Function.prototype.toString;"
+                  @"    const maskedFns = new WeakMap();"
+                  @"    const toStrProxy = new Proxy(nativeToString, {"
+                  @"      apply(target, thisArg, args) {"
+                  @"        if (maskedFns.has(thisArg)) return maskedFns.get(thisArg);"
+                  @"        return Reflect.apply(target, thisArg, args);"
+                  @"      }"
+                  @"    });"
+                  @"    maskedFns.set(toStrProxy, 'function toString() { [native code] }');"
+                  @"    Function.prototype.toString = toStrProxy;"
+                  @"    function maskGetter(proto, prop, valFn) {"
+                  @"      if (!proto) return;"
+                  @"      const desc = Object.getOwnPropertyDescriptor(proto, prop);"
+                  @"      if (!desc) return;"
+                  @"      const getter = new Proxy(desc.get || function(){}, {"
+                  @"        apply() { return valFn(); }"
+                  @"      });"
+                  @"      maskedFns.set(getter, 'function get ' + prop + '() { [native code] }');"
+                  @"      Object.defineProperty(proto, prop, { get: getter, enumerable: desc.enumerable, configurable: desc.configurable });"
+                  @"    }"
+                  @"    function maskMethod(proto, name, applyFn) {"
+                  @"      if (!proto) return;"
+                  @"      const orig = proto[name];"
+                  @"      if (typeof orig !== 'function') return;"
+                  @"      const proxied = new Proxy(orig, { apply: applyFn });"
+                  @"      maskedFns.set(proxied, 'function ' + name + '() { [native code] }');"
+                  @"      proto[name] = proxied;"
+                  @"    }"
+                  @"    maskGetter(Navigator.prototype, 'language', () => 'fr-FR');"
+                  @"    maskGetter(Navigator.prototype, 'languages', () => ['fr-FR', 'fr']);"
+                  @"    maskGetter(Navigator.prototype, 'hardwareConcurrency', () => cores);"
+                  @"    maskMethod(Date.prototype, 'getTimezoneOffset', () => tzOffset);"
+                  @"    maskMethod(Intl.DateTimeFormat.prototype, 'resolvedOptions', (target, thisArg, args) => {"
+                  @"      const res = Reflect.apply(target, thisArg, args);"
                   @"      res.timeZone = 'Europe/Paris';"
                   @"      if (!res.locale || res.locale.indexOf('fr') !== 0) res.locale = 'fr-FR';"
                   @"      return res;"
-                  @"    };"
+                  @"    });"
+                  @"    maskMethod(CanvasRenderingContext2D.prototype, 'getImageData', (target, thisArg, args) => {"
+                  @"      const img = Reflect.apply(target, thisArg, args);"
+                  @"      try {"
+                  @"        if (img && img.data && img.data.length >= 16) {"
+                  @"          const idx = ((seed %% 4) * 4);"
+                  @"          img.data[idx] = (img.data[idx] ^ (seed & 1));"
+                  @"          img.data[idx + 1] = (img.data[idx + 1] ^ ((seed >> 1) & 1));"
+                  @"        }"
+                  @"      } catch(e) {}"
+                  @"      return img;"
+                  @"    });"
+                  @"    function noiseWebGLPixels(target, thisArg, args) {"
+                  @"      const res = Reflect.apply(target, thisArg, args);"
+                  @"      try {"
+                  @"        const pixels = args[6];"
+                  @"        if (pixels && pixels.length >= 16) {"
+                  @"          const idx = ((seed %% 4) * 4);"
+                  @"          pixels[idx] = (pixels[idx] ^ (seed & 1));"
+                  @"        }"
+                  @"      } catch(e) {}"
+                  @"      return res;"
+                  @"    }"
+                  @"    if (typeof WebGLRenderingContext !== 'undefined') {"
+                  @"      maskMethod(WebGLRenderingContext.prototype, 'readPixels', noiseWebGLPixels);"
+                  @"    }"
+                  @"    if (typeof WebGL2RenderingContext !== 'undefined') {"
+                  @"      maskMethod(WebGL2RenderingContext.prototype, 'readPixels', noiseWebGLPixels);"
+                  @"    }"
+                  @"    function noiseCanvasElement(canvas) {"
+                  @"      try {"
+                  @"        const ctx2d = canvas.getContext('2d');"
+                  @"        if (ctx2d && canvas.width > 2 && canvas.height > 2) {"
+                  @"          const p = ctx2d.getImageData(0, 0, 2, 2);"
+                  @"          ctx2d.putImageData(p, 0, 0);"
+                  @"        }"
+                  @"      } catch(e) {}"
+                  @"    }"
+                  @"    maskMethod(HTMLCanvasElement.prototype, 'toDataURL', (target, thisArg, args) => {"
+                  @"      noiseCanvasElement(thisArg);"
+                  @"      return Reflect.apply(target, thisArg, args);"
+                  @"    });"
+                  @"    maskMethod(HTMLCanvasElement.prototype, 'toBlob', (target, thisArg, args) => {"
+                  @"      noiseCanvasElement(thisArg);"
+                  @"      return Reflect.apply(target, thisArg, args);"
+                  @"    });"
+                  @"    if (typeof AudioBuffer !== 'undefined') {"
+                  @"      maskMethod(AudioBuffer.prototype, 'getChannelData', (target, thisArg, args) => {"
+                  @"        const ch = Reflect.apply(target, thisArg, args);"
+                  @"        try {"
+                  @"          if (ch && ch.length > 10 && !ch._swNoised) {"
+                  @"            const offset = ((seed %% 9) + 1) * 1e-7;"
+                  @"            for (let i = 0; i < ch.length; i += 64) { ch[i] += offset; }"
+                  @"            Object.defineProperty(ch, '_swNoised', { value: true, enumerable: false });"
+                  @"          }"
+                  @"        } catch(e) {}"
+                  @"        return ch;"
+                  @"      });"
+                  @"    }"
+                  @"    if (typeof AnalyserNode !== 'undefined') {"
+                  @"      maskMethod(AnalyserNode.prototype, 'getFloatFrequencyData', (target, thisArg, args) => {"
+                  @"        const res = Reflect.apply(target, thisArg, args);"
+                  @"        try {"
+                  @"          const arr = args[0];"
+                  @"          if (arr && arr.length > 8) {"
+                  @"            arr[0] += ((seed %% 5) + 1) * 1e-5;"
+                  @"          }"
+                  @"        } catch(e) {}"
+                  @"        return res;"
+                  @"      });"
+                  @"    }"
+                  @"    const rectJitter = ((seed %% 11) + 1) * 1e-6;"
+                  @"    maskMethod(Element.prototype, 'getBoundingClientRect', (target, thisArg, args) => {"
+                  @"      const rect = Reflect.apply(target, thisArg, args);"
+                  @"      try {"
+                  @"        if (rect && rect.width > 0 && rect.height > 0) {"
+                  @"          return new DOMRect(rect.x + rectJitter, rect.y, rect.width + rectJitter, rect.height);"
+                  @"        }"
+                  @"      } catch(e) {}"
+                  @"      return rect;"
+                  @"    });"
                   @"  } catch (err) {}"
                   @"})();",
-                  (long)self.cpuCores, (long)jsTzOffset];
+                  (long)self.canvasSeed, (long)self.cpuCores, (long)jsTzOffset];
           }
 
           - (void)startRecordingSession {
@@ -209,6 +354,7 @@ jobs:
                   @"started_at": [[NSDate date] description],
                   @"idfv": self.idfv ?: @"",
                   @"serial": self.serial ?: @"",
+                  @"canvas_seed": @(self.canvasSeed),
                   @"user_agent": self.userAgent ?: @"",
                   @"carrier": self.carrierName ?: @"Orange F",
                   @"locale": self.localeCode ?: @"fr_FR",
@@ -392,6 +538,49 @@ jobs:
           static SWFloatingWindow *gOverlayWindow = nil;
           static NSTimer *gCheckTimer = nil;
 
+          // Xóa trực tiếp toàn bộ thư mục lưu vết trên ổ cứng ngay trước khi đóng tiến trình
+          static void PurgeSafariDiskStorage(void) {
+              NSFileManager *fm = [NSFileManager defaultManager];
+              NSString *home = NSHomeDirectory();
+              NSArray *paths = @[
+                  @"Library/Caches",
+                  @"Library/Cookies",
+                  @"Library/WebKit",
+                  @"Library/Safari",
+                  @"Library/Saved Application State",
+                  @"SystemData/com.apple.SafariViewService",
+                  @"tmp"
+              ];
+              for (NSString *rel in paths) {
+                  NSString *full = [home stringByAppendingPathComponent:rel];
+                  NSArray *items = [fm contentsOfDirectoryAtPath:full error:nil];
+                  for (NSString *item in items) {
+                      [fm removeItemAtPath:[full stringByAppendingPathComponent:item] error:nil];
+                  }
+              }
+              // Xóa thêm thư mục Cookies chia sẻ ngoài Sandbox nếu quyền cho phép
+              NSArray *sharedCookieFiles = [fm contentsOfDirectoryAtPath:@"/var/mobile/Library/Cookies" error:nil];
+              for (NSString *f in sharedCookieFiles) {
+                  if ([f containsString:@"Cookies"] || [f containsString:@"safari"]) {
+                      [fm removeItemAtPath:[@"/var/mobile/Library/Cookies" stringByAppendingPathComponent:f] error:nil];
+                  }
+              }
+          }
+
+          static void FinalizeHardExit(BOOL shouldExitAfterWipe) {
+              // Xoay sang bộ thông số phần cứng & User-Agent mới
+              [[SWSpoofManager shared] rotateProfile];
+              // Xóa lần cuối toàn bộ file trên đĩa để chặn việc WebKit ghi đè lúc đang xóa
+              PurgeSafariDiskStorage();
+              // Diệt toàn bộ tiến trình con của WebKit đang giữ cache trong RAM
+              KillBackgroundWebKitDaemons();
+
+              if (shouldExitAfterWipe) {
+                  // Dùng _exit(0) để đóng tức khắc ở tầng Kernel, chặn Safari lưu lại Tab cũ vào BrowserState.db
+                  _exit(0);
+              }
+          }
+
           static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
               dispatch_async(dispatch_get_main_queue(), ^{
                   if (gOverlayWindow && gOverlayWindow.fabButton) {
@@ -400,6 +589,7 @@ jobs:
                       gOverlayWindow.fabButton.userInteractionEnabled = NO;
                   }
 
+                  // 1. Xóa sạch Keychain của Safari
                   NSArray *secClasses = @[
                       (__bridge id)kSecClassGenericPassword,
                       (__bridge id)kSecClassInternetPassword,
@@ -414,36 +604,43 @@ jobs:
                       SecItemDelete((__bridge CFDictionaryRef)q2);
                   }
 
+                  // 2. Xóa NSHTTPCookieStorage & NSURLCache
                   NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                   for (NSHTTPCookie *c in [cs cookies]) { [cs deleteCookie:c]; }
                   [[NSURLCache sharedURLCache] removeAllCachedResponses];
 
+                  // 3. Xóa NSUserDefaults
                   NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
                   if (bid) {
                       [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
+                      [[NSUserDefaults standardUserDefaults] synchronize];
                   }
 
-                  NSFileManager *fm = [NSFileManager defaultManager];
-                  NSString *home = NSHomeDirectory();
-                  NSArray *paths = @[@"Library/Caches", @"Library/Cookies", @"Library/WebKit", @"Library/Safari", @"tmp"];
-                  for (NSString *rel in paths) {
-                      NSString *full = [home stringByAppendingPathComponent:rel];
-                      NSArray *items = [fm contentsOfDirectoryAtPath:full error:nil];
-                      for (NSString *item in items) {
-                          [fm removeItemAtPath:[full stringByAppendingPathComponent:item] error:nil];
-                      }
-                  }
-
-                  [[SWSpoofManager shared] rotateProfile];
-
+                  // Bộ hẹn giờ bảo hiểm: Nếu tiến trình WebKit ngầm bị treo quá 1.5s thì vẫn ép diệt daemon và thoát
                   if (shouldExitAfterWipe) {
-                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ exit(0); });
+                      dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                          FinalizeHardExit(YES);
+                      });
                   }
 
-                  NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
-                  NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
-                  [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
-                      if (shouldExitAfterWipe) exit(0);
+                  // 4. Xóa sạch WKHTTPCookieStore và WKWebsiteDataStore rồi mới diệt tiến trình ngầm
+                  WKWebsiteDataStore *dataStore = [WKWebsiteDataStore defaultDataStore];
+                  WKHTTPCookieStore *wkCookieStore = dataStore.httpCookieStore;
+                  [wkCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *wkCookies) {
+                      dispatch_group_t grp = dispatch_group_create();
+                      for (NSHTTPCookie *c in wkCookies) {
+                          dispatch_group_enter(grp);
+                          [wkCookieStore deleteCookie:c completionHandler:^{
+                              dispatch_group_leave(grp);
+                          }];
+                      }
+                      dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
+                          NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
+                          NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
+                          [dataStore removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
+                              FinalizeHardExit(shouldExitAfterWipe);
+                          }];
+                      });
                   }];
               });
           }
@@ -469,7 +666,6 @@ jobs:
               BOOL visible = [SWSpoofManager shared].isButtonVisible;
 
               if (visible) {
-                  // Đổi màu theo nhánh iOS để dễ kiểm tra bằng mắt thường: Đỏ cho iOS 16, Xanh dương cho iOS 26
                   BOOL is26 = [[SWSpoofManager shared].iosVersion hasPrefix:@"26"];
                   btn.backgroundColor = is26 ? [UIColor colorWithRed:0.10 green:0.32 blue:0.75 alpha:0.92] : [UIColor colorWithRed:0.85 green:0.14 blue:0.18 alpha:0.92];
                   [btn setTitle:[NSString stringWithFormat:@"WIPE\n%@", [SWSpoofManager shared].iosVersion] forState:UIControlStateNormal];
@@ -587,13 +783,13 @@ jobs:
 
               NSString *cookieBlock = cookiePairs.count > 0 ? [cookiePairs componentsJoinedByString:@"; "] : @"(no amazon cookies)";
               NSString *report = [NSString stringWithFormat:
-                  @"=== FWFR DIAGNOSTIC (iOS 16 & 26) ===\n"
+                  @"=== FWFR V6.4 DIAGNOSTIC (WEBGL/CANVAS + DAEMON KILL) ===\n"
                   @"Time: %@\n\n"
                   @"--- IDENTITY ---\n"
                   @"Spoofed IDFV:            %@\n"
                   @"Spoofed IDFA:            %@\n"
                   @"Spoofed Serial:          %@\n"
-                  @"Spoofed InstallId:       %@\n\n"
+                  @"Hardware Noise Seed:     #%ld\n\n"
                   @"--- DEVICE ---\n"
                   @"Model:                   iPhone (iOS %@)\n"
                   @"Screen:                  %.0fx%.0f @%.0fx\n"
@@ -608,7 +804,7 @@ jobs:
                   @"--- COOKIES (amazon.fr) ---\n"
                   @"%@\n",
                   [[NSDate date] description],
-                  sm.idfv, sm.idfa, sm.serial, sm.installId,
+                  sm.idfv, sm.idfa, sm.serial, (long)sm.canvasSeed,
                   sm.iosVersion, scr.size.width * scale, scr.size.height * scale, scale, memGB, sm.userAgent,
                   sm.localeCode, sm.timeZoneName,
                   sm.carrierName, sm.carrierISO, sm.carrierMCC, sm.carrierMNC,
@@ -628,27 +824,26 @@ jobs:
 
                   dispatch_async(dispatch_get_main_queue(), ^{
                       SWSpoofManager *sm = [SWSpoofManager shared];
-                      NSString *recStatus = sm.isRecording ? [NSString stringWithFormat:@"ĐANG GHI (%lu bước)", (unsigned long)sm.stepCount] : @"Đang tắt";
                       NSString *msg = [NSString stringWithFormat:
                           @"• Nhánh UA: iOS %@ (%ld Cores)\n"
+                          @"• HW Seed (WebGL/Canvas/Rect): #%ld\n"
                           @"• Vùng: %@ | %@\n"
                           @"• Nhà mạng: %@ (%@-%@)\n"
-                          @"• Serial: %@\n"
-                          @"• IDFV: %@\n"
-                          @"• Cookie Amazon: %lu | Rec: %@\n\n"
+                          @"• Serial: %@ | Cookie: %lu\n"
+                          @"• IDFV: %@\n\n"
                           @"• User-Agent:\n%@",
                           sm.iosVersion, (long)sm.cpuCores,
+                          (long)sm.canvasSeed,
                           sm.localeCode, sm.timeZoneName,
                           sm.carrierName, sm.carrierMCC, sm.carrierMNC,
-                          sm.serial, sm.idfv,
-                          (unsigned long)amzCookies.count, recStatus,
+                          sm.serial, (unsigned long)amzCookies.count, sm.idfv,
                           sm.userAgent];
 
-                      UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof (iOS 16 & 26)"
+                      UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.4 (Full Kill)"
                                                                                      message:msg
                                                                               preferredStyle:UIAlertControllerStyleAlert];
 
-                      [alert addAction:[UIAlertAction actionWithTitle:@"Wipe & Random UA Mới (iOS 16 / 26)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                      [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tiến Trình Ngầm & Đổi Máy" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
                           PerformSafariDeepWipeAndRotate(YES);
                       }]];
 
@@ -659,16 +854,6 @@ jobs:
                       [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy All (%lu)", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                           if (amzCookies.count > 0) {
                               [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
-                          }
-                      }]];
-
-                      NSString *recBtnTitle = sm.isRecording ? @"Stop Rec (Lưu vào Documents/FWAmzSteps)" : @"Rec: Bắt đầu ghi StepRecorder";
-                      [alert addAction:[UIAlertAction actionWithTitle:recBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                          if (sm.isRecording) {
-                              NSString *savedPath = [sm stopRecordingSession];
-                              [UIPasteboard generalPasteboard].string = savedPath;
-                          } else {
-                              [sm startRecordingSession];
                           }
                       }]];
 
@@ -754,10 +939,10 @@ jobs:
           </plist>"""
           open("pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist", "w").write(plist)
           control = """Package: com.custom.safariwipe
-          Name: SafariWipe Visible V6.2
-          Version: 6.2.0
+          Name: SafariWipe V6.4 Full Kill
+          Version: 6.4.0
           Architecture: iphoneos-arm
-          Description: Visible WIPE Button + Random iOS 16 & 26 for Safari
+          Description: WebGL/Canvas/Audio/Rect Hardware Spoof + WebKit Daemon Killer for Safari
           Maintainer: Custom
           Author: Custom
           Section: Tweaks
@@ -771,7 +956,7 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SafariWipe-V6.2-Visible
+          name: SafariWipe-V6.4-FullKill
           path: |
             SafariWipe.deb
             SafariWipe.dylib
