@@ -15,6 +15,47 @@
 
 extern char **environ;
 
+static NSHashTable<WKWebView *> *gTrackedWebViews = nil;
+
+static void TrackWebView(WKWebView *wv) {
+    if (!wv) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (!gTrackedWebViews) {
+            gTrackedWebViews = [NSHashTable weakObjectsHashTable];
+        }
+        [gTrackedWebViews addObject:wv];
+    });
+}
+
+static void FindWebViewsInView(UIView *view, NSMutableSet<WKWebView *> *outSet) {
+    if (!view || !outSet) return;
+    if ([view isKindOfClass:[WKWebView class]]) {
+        [outSet addObject:(WKWebView *)view];
+    }
+    for (UIView *sub in view.subviews) {
+        FindWebViewsInView(sub, outSet);
+    }
+}
+
+static NSSet<WKWebView *> *GetAllActiveSafariWebViews(void) {
+    NSMutableSet<WKWebView *> *all = [NSMutableSet set];
+    if (gTrackedWebViews) {
+        for (WKWebView *wv in gTrackedWebViews) {
+            if (wv) [all addObject:wv];
+        }
+    }
+    UIApplication *app = [UIApplication sharedApplication];
+    for (UIScene *scene in app.connectedScenes) {
+        if ([scene isKindOfClass:[UIWindowScene class]]) {
+            UIWindowScene *ws = (UIWindowScene *)scene;
+            for (UIWindow *win in ws.windows) {
+                FindWebViewsInView(win, all);
+            }
+        }
+    }
+    return all;
+}
+
 static void KillBackgroundWebKitDaemons(void) {
     const char *killallPaths[] = {
         "/var/jb/usr/bin/killall",
@@ -89,7 +130,7 @@ static void KillBackgroundWebKitDaemons(void) {
 - (NSString *)profilePath {
     NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
     [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v66.plist"];
+    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v69.plist"];
 }
 
 - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
@@ -103,9 +144,12 @@ static void KillBackgroundWebKitDaemons(void) {
 
 - (void)loadOrGenerateProfile {
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:[self profilePath]];
-    if (dict && dict[@"userAgent"] && dict[@"idfv"]) {
+    NSString *savedVer = dict[@"iosVersion"] ?: @"";
+    BOOL isValid16_6Plus = ([savedVer hasPrefix:@"16.6"] || [savedVer hasPrefix:@"16.7"]);
+
+    if (dict && dict[@"userAgent"] && dict[@"idfv"] && isValid16_6Plus) {
         self.userAgent = dict[@"userAgent"];
-        self.iosVersion = dict[@"iosVersion"] ?: @"26.0";
+        self.iosVersion = savedVer;
         self.idfv = dict[@"idfv"];
         self.idfa = dict[@"idfa"] ?: [[NSUUID UUID] UUIDString];
         self.serial = dict[@"serial"] ?: [self randomStringWithChars:@"ABCDEFGHJKLMNPQRSTUVWXYZ0123456789" length:12];
@@ -120,7 +164,7 @@ static void KillBackgroundWebKitDaemons(void) {
         self.canvasSeed = [dict[@"canvasSeed"] integerValue] ?: 582913;
         self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
     } else {
-        self.isButtonVisible = YES;
+        self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
         [self rotateProfile];
     }
 }
@@ -128,7 +172,7 @@ static void KillBackgroundWebKitDaemons(void) {
 - (void)saveProfile {
     NSDictionary *dict = @{
         @"userAgent": self.userAgent ?: @"",
-        @"iosVersion": self.iosVersion ?: @"26.0",
+        @"iosVersion": self.iosVersion ?: @"16.6",
         @"idfv": self.idfv ?: [[NSUUID UUID] UUIDString],
         @"idfa": self.idfa ?: [[NSUUID UUID] UUIDString],
         @"serial": self.serial ?: @"",
@@ -147,29 +191,22 @@ static void KillBackgroundWebKitDaemons(void) {
 }
 
 - (void)rotateProfile {
-    NSArray<NSArray<NSString *> *> *ios16Profiles = @[
-        @[@"16_5",    @"16.5", @"16.5"],
+    // Cố định chỉ random từ iOS 16.6 trở lên (Tất cả đều đồng bộ Version/16.6 chuẩn của Apple)
+    NSArray<NSArray<NSString *> *> *ios16_6PlusProfiles = @[
         @[@"16_6",    @"16.6", @"16.6"],
         @[@"16_6_1",  @"16.6", @"16.6.1"],
+        @[@"16_7",    @"16.6", @"16.7"],
+        @[@"16_7_1",  @"16.6", @"16.7.1"],
+        @[@"16_7_2",  @"16.6", @"16.7.2"],
+        @[@"16_7_4",  @"16.6", @"16.7.4"],
+        @[@"16_7_5",  @"16.6", @"16.7.5"],
+        @[@"16_7_7",  @"16.6", @"16.7.7"],
         @[@"16_7_8",  @"16.6", @"16.7.8"],
         @[@"16_7_10", @"16.6", @"16.7.10"],
         @[@"16_7_16", @"16.6", @"16.7.16"]
     ];
 
-    NSArray<NSArray<NSString *> *> *ios26Profiles = @[
-        @[@"18_6",   @"26.0", @"26.0"],
-        @[@"18_6",   @"26.1", @"26.1"],
-        @[@"18_6",   @"26.2", @"26.2"],
-        @[@"26_0",   @"26.0", @"26.0"],
-        @[@"26_0_1", @"26.0", @"26.0.1"],
-        @[@"26_1",   @"26.1", @"26.1"],
-        @[@"26_2",   @"26.2", @"26.2"],
-        @[@"26_3",   @"26.3", @"26.3"]
-    ];
-
-    BOOL pickIOS26 = (arc4random_uniform(2) == 1);
-    NSArray<NSArray<NSString *> *> *pool = pickIOS26 ? ios26Profiles : ios16Profiles;
-    NSArray<NSString *> *picked = pool[arc4random_uniform((uint32_t)pool.count)];
+    NSArray<NSString *> *picked = ios16_6PlusProfiles[arc4random_uniform((uint32_t)ios16_6PlusProfiles.count)];
 
     NSArray<NSArray<NSString *> *> *frCarriers = @[
         @[@"Orange F",         @"fr", @"208", @"01"],
@@ -205,7 +242,6 @@ static void KillBackgroundWebKitDaemons(void) {
     NSInteger secondsFromGMT = [parisTZ secondsFromGMTForDate:[NSDate date]];
     NSInteger jsTzOffset = -(secondsFromGMT / 60);
 
-    // Zero-Footprint IIFE: Không gắn bất kỳ biến hay thuộc tính nào lên window hoặc Array
     return [NSString stringWithFormat:
         @"(function() {"
         @"  try {"
@@ -347,7 +383,6 @@ static void KillBackgroundWebKitDaemons(void) {
 
 - (void)injectIntoUserContentController:(WKUserContentController *)ucc {
     if (!ucc) return;
-    // Kiểm tra ở tầng Objective-C để không bao giờ nạp trùng WKUserScript
     for (WKUserScript *existing in ucc.userScripts) {
         if ([existing.source containsString:@"Europe/Paris"]) {
             return;
@@ -385,9 +420,7 @@ static void KillBackgroundWebKitDaemons(void) {
     [[WKWebsiteDataStore defaultDataStore].httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
         NSMutableDictionary *cookieDict = [NSMutableDictionary dictionary];
         for (NSHTTPCookie *c in cookies) {
-            if ([c.domain containsString:@"amazon"]) {
-                cookieDict[c.name] = c.value;
-            }
+            cookieDict[c.name] = c.value;
         }
         NSDictionary *stepData = @{
             @"step": @(idx),
@@ -403,6 +436,101 @@ static void KillBackgroundWebKitDaemons(void) {
 }
 
 @end
+
+static void CollectAllSafariCookies(void (^completion)(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies)) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSMutableDictionary<NSString *, NSString *> *amzMap = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSString *> *allMap = [NSMutableDictionary dictionary];
+
+        void (^addCookieObj)(NSHTTPCookie *) = ^(NSHTTPCookie *c) {
+            if (!c || !c.name || !c.value) return;
+            NSString *pair = [NSString stringWithFormat:@"%@=%@", c.name, c.value];
+            allMap[c.name] = pair;
+            NSString *dom = (c.domain ?: @"").lowercaseString;
+            NSString *nam = c.name.lowercaseString;
+            if ([dom containsString:@"amazon"] ||
+                [nam hasSuffix:@"acbfr"] ||
+                [nam isEqualToString:@"session-id"] ||
+                [nam isEqualToString:@"session-token"] ||
+                [nam isEqualToString:@"session-id-time"] ||
+                [nam isEqualToString:@"i18n-prefs"] ||
+                [nam isEqualToString:@"sp-cdn"]) {
+                amzMap[c.name] = pair;
+            }
+        };
+
+        for (NSHTTPCookie *c in [[NSHTTPCookieStorage sharedHTTPCookieStorage] cookies]) {
+            addCookieObj(c);
+        }
+
+        NSSet<WKWebView *> *webViews = GetAllActiveSafariWebViews();
+        NSMutableSet<WKWebsiteDataStore *> *dataStores = [NSMutableSet set];
+        if ([WKWebsiteDataStore defaultDataStore]) {
+            [dataStores addObject:[WKWebsiteDataStore defaultDataStore]];
+        }
+        for (WKWebView *wv in webViews) {
+            if (wv.configuration.websiteDataStore) {
+                [dataStores addObject:wv.configuration.websiteDataStore];
+            }
+        }
+
+        dispatch_group_t grp = dispatch_group_create();
+
+        for (WKWebsiteDataStore *ds in dataStores) {
+            dispatch_group_enter(grp);
+            [ds.httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    for (NSHTTPCookie *c in cookies) {
+                        addCookieObj(c);
+                    }
+                    dispatch_group_leave(grp);
+                });
+            }];
+        }
+
+        for (WKWebView *wv in webViews) {
+            dispatch_group_enter(grp);
+            NSString *currentHost = (wv.URL.host ?: @"").lowercaseString;
+            [wv evaluateJavaScript:@"document.cookie" completionHandler:^(id result, NSError *error) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    if ([result isKindOfClass:[NSString class]]) {
+                        NSString *raw = (NSString *)result;
+                        NSArray<NSString *> *parts = [raw componentsSeparatedByString:@";"];
+                        for (NSString *part in parts) {
+                            NSString *trimmed = [part stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                            NSRange eq = [trimmed rangeOfString:@"="];
+                            if (eq.location != NSNotFound && eq.location > 0) {
+                                NSString *k = [trimmed substringToIndex:eq.location];
+                                allMap[k] = trimmed;
+                                NSString *kLow = k.lowercaseString;
+                                if ([currentHost containsString:@"amazon"] ||
+                                    [kLow hasSuffix:@"acbfr"] ||
+                                    [kLow isEqualToString:@"session-id"] ||
+                                    [kLow isEqualToString:@"session-token"] ||
+                                    [kLow isEqualToString:@"csm-hit"]) {
+                                    amzMap[k] = trimmed;
+                                }
+                            }
+                        }
+                    }
+                    dispatch_group_leave(grp);
+                });
+            }];
+        }
+
+        __block BOOL didCallback = NO;
+        void (^finishBlock)(void) = ^{
+            if (didCallback) return;
+            didCallback = YES;
+            if (completion) {
+                completion([amzMap allValues], [allMap allValues]);
+            }
+        };
+
+        dispatch_group_notify(grp, dispatch_get_main_queue(), finishBlock);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), finishBlock);
+    });
+}
 
 static IMP orig_WKWebView_initWithFrameConfig = NULL;
 static IMP orig_WKWebView_setCustomUA = NULL;
@@ -420,6 +548,7 @@ static WKWebView* swizzled_WKWebView_initWithFrameConfig(WKWebView *self, SEL _c
     }
     WKWebView *webView = ((WKWebView* (*)(id, SEL, CGRect, WKWebViewConfiguration *))orig_WKWebView_initWithFrameConfig)(self, _cmd, frame, configuration);
     if (webView) {
+        TrackWebView(webView);
         [[SWSpoofManager shared] injectIntoUserContentController:webView.configuration.userContentController];
         NSString *spoofedUA = [SWSpoofManager shared].userAgent;
         if (spoofedUA.length > 0 && orig_WKWebView_setCustomUA) {
@@ -435,6 +564,7 @@ static void swizzled_WKUCC_removeAllUserScripts(WKUserContentController *self, S
 }
 
 static void swizzled_WKWebView_setCustomUA(WKWebView *self, SEL _cmd, NSString *customUserAgent) {
+    TrackWebView(self);
     NSString *spoofedUA = [SWSpoofManager shared].userAgent;
     if (customUserAgent && [customUserAgent containsString:@"Macintosh"]) {
         ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(self, _cmd, customUserAgent);
@@ -446,6 +576,7 @@ static void swizzled_WKWebView_setCustomUA(WKWebView *self, SEL _cmd, NSString *
 }
 
 static WKNavigation* swizzled_WKWebView_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *request) {
+    TrackWebView(self);
     [[SWSpoofManager shared] injectIntoUserContentController:self.configuration.userContentController];
     if ([SWSpoofManager shared].isRecording && request.URL.absoluteString) {
         [[SWSpoofManager shared] recordStepWithType:@"WEB_NAV" url:request.URL.absoluteString];
@@ -663,6 +794,17 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             gOverlayWindow.fabButton.userInteractionEnabled = NO;
         }
 
+        NSMutableSet<WKWebsiteDataStore *> *allDataStores = [NSMutableSet set];
+        if ([WKWebsiteDataStore defaultDataStore]) {
+            [allDataStores addObject:[WKWebsiteDataStore defaultDataStore]];
+        }
+        for (WKWebView *wv in GetAllActiveSafariWebViews()) {
+            if (wv.configuration.websiteDataStore) {
+                [allDataStores addObject:wv.configuration.websiteDataStore];
+            }
+            [wv evaluateJavaScript:@"try{localStorage.clear();sessionStorage.clear();}catch(e){}" completionHandler:nil];
+        }
+
         CloseAllSafariOpenTabsInRAM();
 
         NSArray *secClasses = @[
@@ -697,24 +839,25 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             });
         }
 
-        WKWebsiteDataStore *dataStore = [WKWebsiteDataStore defaultDataStore];
-        WKHTTPCookieStore *wkCookieStore = dataStore.httpCookieStore;
-        [wkCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *wkCookies) {
-            dispatch_group_t grp = dispatch_group_create();
-            for (NSHTTPCookie *c in wkCookies) {
-                dispatch_group_enter(grp);
-                [wkCookieStore deleteCookie:c completionHandler:^{
-                    dispatch_group_leave(grp);
+        NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
+        NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
+        dispatch_group_t wipeGrp = dispatch_group_create();
+
+        for (WKWebsiteDataStore *ds in allDataStores) {
+            dispatch_group_enter(wipeGrp);
+            [ds.httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *wkCookies) {
+                for (NSHTTPCookie *c in wkCookies) {
+                    [ds.httpCookieStore deleteCookie:c completionHandler:nil];
+                }
+                [ds removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
+                    dispatch_group_leave(wipeGrp);
                 }];
-            }
-            dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
-                NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
-                NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
-                [dataStore removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
-                    FinalizeHardExit(shouldExitAfterWipe);
-                }];
-            });
-        }];
+            }];
+        }
+
+        dispatch_group_notify(wipeGrp, dispatch_get_main_queue(), ^{
+            FinalizeHardExit(shouldExitAfterWipe);
+        });
     });
 }
 
@@ -739,8 +882,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     BOOL visible = [SWSpoofManager shared].isButtonVisible;
 
     if (visible) {
-        BOOL is26 = [[SWSpoofManager shared].iosVersion hasPrefix:@"26"];
-        btn.backgroundColor = is26 ? [UIColor colorWithRed:0.10 green:0.32 blue:0.75 alpha:0.92] : [UIColor colorWithRed:0.85 green:0.14 blue:0.18 alpha:0.92];
+        btn.backgroundColor = [UIColor colorWithRed:0.85 green:0.14 blue:0.18 alpha:0.92];
         [btn setTitle:[NSString stringWithFormat:@"WIPE\n%@", [SWSpoofManager shared].iosVersion] forState:UIControlStateNormal];
         [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
         btn.layer.borderWidth = 2.0;
@@ -848,15 +990,16 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     }
 }
 
-- (void)copyDiagnosticReportWithCookies:(NSArray<NSString *> *)cookiePairs {
+- (void)copyDiagnosticReportWithAmzCookies:(NSArray<NSString *> *)amzCookies allCookies:(NSArray<NSString *> *)allCookies {
     SWSpoofManager *sm = [SWSpoofManager shared];
     CGRect scr = [UIScreen mainScreen].bounds;
     CGFloat scale = [UIScreen mainScreen].scale;
     double memGB = (double)[NSProcessInfo processInfo].physicalMemory / (1024.0 * 1024.0 * 1024.0);
 
-    NSString *cookieBlock = cookiePairs.count > 0 ? [cookiePairs componentsJoinedByString:@"; "] : @"(no cookies)";
+    NSArray<NSString *> *targetCookies = amzCookies.count > 0 ? amzCookies : allCookies;
+    NSString *cookieBlock = targetCookies.count > 0 ? [targetCookies componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V6.6 DIAGNOSTIC (ZERO-FOOTPRINT JS) ===\n"
+        @"=== SAFARI V6.9 DIAGNOSTIC (iOS 16.6+ ONLY) ===\n"
         @"Time: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
@@ -874,89 +1017,87 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
         @"--- CARRIER ---\n"
         @"CarrierName:             %@\n"
         @"ISO / MCC / MNC:         %@ / %@ / %@\n\n"
-        @"--- COOKIES ---\n"
+        @"--- COOKIES (Amazon: %lu | Total: %lu) ---\n"
         @"%@\n",
         [[NSDate date] description],
         sm.idfv, sm.idfa, sm.serial, (long)sm.canvasSeed,
         sm.iosVersion, scr.size.width * scale, scr.size.height * scale, scale, memGB, sm.userAgent,
         sm.localeCode, sm.timeZoneName,
         sm.carrierName, sm.carrierISO, sm.carrierMCC, sm.carrierMNC,
+        (unsigned long)amzCookies.count, (unsigned long)allCookies.count,
         cookieBlock];
 
     [UIPasteboard generalPasteboard].string = report;
 }
 
 - (void)showMainPanel {
-    [[WKWebsiteDataStore defaultDataStore].httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
-        NSMutableArray<NSString *> *amzCookies = [NSMutableArray array];
-        for (NSHTTPCookie *c in cookies) {
-            if ([c.domain containsString:@"amazon"]) {
-                [amzCookies addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
-            }
+    CollectAllSafariCookies(^(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies) {
+        SWSpoofManager *sm = [SWSpoofManager shared];
+        NSString *recStatus = sm.isRecording ? [NSString stringWithFormat:@"ĐANG GHI (%lu bước)", (unsigned long)sm.stepCount] : @"Đang tắt";
+        NSString *msg = [NSString stringWithFormat:
+            @"• Nhánh UA: iOS %@ (%ld Cores)\n"
+            @"• HW Seed (WebGL/Canvas/Rect): #%ld\n"
+            @"• Vùng: %@ | %@\n"
+            @"• Nhà mạng: %@ (%@-%@)\n"
+            @"• Cookie Amazon: %lu | Tổng Cookie: %lu\n"
+            @"• Serial: %@ | Rec: %@\n"
+            @"• IDFV: %@\n\n"
+            @"• User-Agent:\n%@",
+            sm.iosVersion, (long)sm.cpuCores,
+            (long)sm.canvasSeed,
+            sm.localeCode, sm.timeZoneName,
+            sm.carrierName, sm.carrierMCC, sm.carrierMNC,
+            (unsigned long)amzCookies.count, (unsigned long)allCookies.count,
+            sm.serial, recStatus, sm.idfv,
+            sm.userAgent];
+
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.9 (iOS 16.6+)"
+                                                                       message:msg
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + Tiến Trình & Đổi Máy (16.6+)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            PerformSafariDeepWipeAndRotate(YES);
+        }]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Info: Copy Diagnostic Report" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self copyDiagnosticReportWithAmzCookies:amzCookies allCookies:allCookies];
+        }]];
+
+        if (amzCookies.count > 0) {
+            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy Amazon.fr (%lu)", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
+            }]];
         }
 
-        dispatch_async(dispatch_get_main_queue(), ^{
-            SWSpoofManager *sm = [SWSpoofManager shared];
-            NSString *recStatus = sm.isRecording ? [NSString stringWithFormat:@"ĐANG GHI (%lu bước)", (unsigned long)sm.stepCount] : @"Đang tắt";
-            NSString *msg = [NSString stringWithFormat:
-                @"• Nhánh UA: iOS %@ (%ld Cores)\n"
-                @"• HW Seed (WebGL/Canvas/Rect): #%ld\n"
-                @"• Vùng: %@ | %@\n"
-                @"• Nhà mạng: %@ (%@-%@)\n"
-                @"• Serial: %@ | Cookie: %lu\n"
-                @"• Rec: %@\n"
-                @"• IDFV: %@\n\n"
-                @"• User-Agent:\n%@",
-                sm.iosVersion, (long)sm.cpuCores,
-                (long)sm.canvasSeed,
-                sm.localeCode, sm.timeZoneName,
-                sm.carrierName, sm.carrierMCC, sm.carrierMNC,
-                sm.serial, (unsigned long)amzCookies.count,
-                recStatus, sm.idfv,
-                sm.userAgent];
-
-            UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V6.6 (Zero-Footprint)"
-                                                                           message:msg
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-
-            [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + Tiến Trình & Đổi Máy" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-                PerformSafariDeepWipeAndRotate(YES);
-            }]];
-
-            [alert addAction:[UIAlertAction actionWithTitle:@"Info: Copy Diagnostic Report" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                [self copyDiagnosticReportWithCookies:amzCookies];
-            }]];
-
-            [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy All (%lu)", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                if (amzCookies.count > 0) {
-                    [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
-                }
-            }]];
-
-            NSString *recBtnTitle = sm.isRecording ? @"Stop Rec (Lưu vào Documents/FWAmzSteps)" : @"Rec: Bắt đầu ghi StepRecorder";
-            [alert addAction:[UIAlertAction actionWithTitle:recBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                if (sm.isRecording) {
-                    NSString *savedPath = [sm stopRecordingSession];
-                    [UIPasteboard generalPasteboard].string = savedPath;
-                } else {
-                    [sm startRecordingSession];
-                }
-            }]];
-
-            NSString *visTitle = sm.isButtonVisible ? @"Chế độ: Ẩn nút nổi (Stealth)" : @"Chế độ: Hiện lại nút nổi";
-            [alert addAction:[UIAlertAction actionWithTitle:visTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-                sm.isButtonVisible = !sm.isButtonVisible;
-                [sm saveProfile];
-                [self applyButtonAppearance];
-            }]];
-
-            [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
-
-            if (gOverlayWindow && gOverlayWindow.rootViewController) {
-                [gOverlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy Tất Cả (%lu)", (unsigned long)allCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            if (allCookies.count > 0) {
+                [UIPasteboard generalPasteboard].string = [allCookies componentsJoinedByString:@"; "];
             }
-        });
-    }];
+        }]];
+
+        NSString *recBtnTitle = sm.isRecording ? @"Stop Rec (Lưu vào Documents/FWAmzSteps)" : @"Rec: Bắt đầu ghi StepRecorder";
+        [alert addAction:[UIAlertAction actionWithTitle:recBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            if (sm.isRecording) {
+                NSString *savedPath = [sm stopRecordingSession];
+                [UIPasteboard generalPasteboard].string = savedPath;
+            } else {
+                [sm startRecordingSession];
+            }
+        }]];
+
+        NSString *visTitle = sm.isButtonVisible ? @"Chế độ: Ẩn nút nổi (Stealth)" : @"Chế độ: Hiện lại nút nổi";
+        [alert addAction:[UIAlertAction actionWithTitle:visTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            sm.isButtonVisible = !sm.isButtonVisible;
+            [sm saveProfile];
+            [self applyButtonAppearance];
+        }]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+
+        if (gOverlayWindow && gOverlayWindow.rootViewController) {
+            [gOverlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+        }
+    });
 }
 
 - (void)onPanned:(UIPanGestureRecognizer *)pan {
