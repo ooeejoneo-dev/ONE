@@ -1,4 +1,4 @@
-name: Build SafariWipe V2
+name: Build SafariWipe V5 Stealth for RootHide
 
 on: [push, workflow_dispatch]
 
@@ -9,22 +9,243 @@ jobs:
       - name: Create Source File
         run: |
           python3 -c '
-          code = """#import <Foundation/Foundation.h>
+          code = r"""#import <Foundation/Foundation.h>
           #import <UIKit/UIKit.h>
           #import <WebKit/WebKit.h>
           #import <Security/Security.h>
           #import <QuartzCore/QuartzCore.h>
           #import <CoreGraphics/CoreGraphics.h>
+          #import <objc/runtime.h>
           #import <notify.h>
           #import <stdlib.h>
 
+          // ============================================================================
+          // 1. QUẢN LÝ HỒ SƠ & TRẠNG THÁI ẨN NÚT (PROFILE & STEALTH MANAGER)
+          // ============================================================================
+          @interface SWSpoofManager : NSObject
+          @property (nonatomic, copy) NSString *userAgent;
+          @property (nonatomic, copy) NSString *iosVersion;
+          @property (nonatomic, copy) NSString *idfv;
+          @property (nonatomic, copy) NSString *localeCode;
+          @property (nonatomic, copy) NSString *timeZoneName;
+          @property (nonatomic, assign) NSInteger cpuCores;
+          @property (nonatomic, assign) BOOL isButtonVisible;   // NO = Ẩn nút (Mặc định)
+          @property (nonatomic, assign) BOOL isTouchZoneActive; // YES = Cho phép bấm vào vùng tàng hình
+
+          + (instancetype)shared;
+          - (void)rotateProfile;
+          - (void)saveProfile;
+          - (void)applyFrenchEnvironment;
+          - (NSString *)buildEnvironmentJS;
+          @end
+
+          @implementation SWSpoofManager
+
+          + (instancetype)shared {
+              static SWSpoofManager *inst = nil;
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  inst = [[self alloc] init];
+                  [inst loadOrGenerateProfile];
+                  [inst applyFrenchEnvironment];
+              });
+              return inst;
+          }
+
+          - (NSString *)profilePath {
+              NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+              [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
+              return [docDir stringByAppendingPathComponent:@".safari_amzfr_v5.plist"];
+          }
+
+          - (void)applyFrenchEnvironment {
+              NSTimeZone *parisTZ = [NSTimeZone timeZoneWithName:@"Europe/Paris"];
+              if (parisTZ) {
+                  [NSTimeZone setDefaultTimeZone:parisTZ];
+              }
+              [[NSUserDefaults standardUserDefaults] setObject:@[@"fr-FR", @"fr"] forKey:@"AppleLanguages"];
+              [[NSUserDefaults standardUserDefaults] setObject:@"fr_FR" forKey:@"AppleLocale"];
+          }
+
+          - (void)loadOrGenerateProfile {
+              NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:[self profilePath]];
+              if (dict && dict[@"userAgent"] && dict[@"idfv"]) {
+                  self.userAgent = dict[@"userAgent"];
+                  self.iosVersion = dict[@"iosVersion"] ?: @"17.5.1";
+                  self.idfv = dict[@"idfv"];
+                  self.localeCode = dict[@"localeCode"] ?: @"fr-FR";
+                  self.timeZoneName = dict[@"timeZoneName"] ?: @"Europe/Paris";
+                  self.cpuCores = [dict[@"cpuCores"] integerValue] ?: 6;
+                  self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : NO;
+                  self.isTouchZoneActive = dict[@"isTouchZoneActive"] ? [dict[@"isTouchZoneActive"] boolValue] : YES;
+              } else {
+                  self.localeCode = @"fr-FR";
+                  self.timeZoneName = @"Europe/Paris";
+                  self.isButtonVisible = NO;     // Mặc định ẩn nút hoàn toàn
+                  self.isTouchZoneActive = YES;  // Mặc định vẫn nhận chạm tại góc tàng hình
+                  [self rotateProfile];
+              }
+          }
+
+          - (void)saveProfile {
+              NSDictionary *dict = @{
+                  @"userAgent": self.userAgent ?: @"",
+                  @"iosVersion": self.iosVersion ?: @"17.5.1",
+                  @"idfv": self.idfv ?: [[NSUUID UUID] UUIDString],
+                  @"localeCode": self.localeCode ?: @"fr-FR",
+                  @"timeZoneName": self.timeZoneName ?: @"Europe/Paris",
+                  @"cpuCores": @(self.cpuCores),
+                  @"isButtonVisible": @(self.isButtonVisible),
+                  @"isTouchZoneActive": @(self.isTouchZoneActive)
+              };
+              [dict writeToFile:[self profilePath] atomically:YES];
+          }
+
+          - (void)rotateProfile {
+              NSArray<NSArray<NSString *> *> *uaProfiles = @[
+                  @[@"16_6",   @"16.6",   @"16.6"],
+                  @[@"16_7_8", @"16.6",   @"16.7.8"],
+                  @[@"17_3_1", @"17.3",   @"17.3.1"],
+                  @[@"17_4_1", @"17.4.1", @"17.4.1"],
+                  @[@"17_5_1", @"17.5",   @"17.5.1"],
+                  @[@"17_6_1", @"17.6",   @"17.6.1"],
+                  @[@"17_7",   @"17.7",   @"17.7"],
+                  @[@"18_0_1", @"18.0.1", @"18.0.1"],
+                  @[@"18_1",   @"18.1",   @"18.1"],
+                  @[@"18_2",   @"18.2",   @"18.2"]
+              ];
+
+              uint32_t idx = arc4random_uniform((uint32_t)uaProfiles.count);
+              NSArray<NSString *> *picked = uaProfiles[idx];
+
+              self.iosVersion = picked[2];
+              self.userAgent = [NSString stringWithFormat:@"Mozilla/5.0 (iPhone; CPU iPhone OS %@ like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/%@ Mobile/15E148 Safari/604.1", picked[0], picked[1]];
+              self.idfv = [[NSUUID UUID] UUIDString];
+              self.localeCode = @"fr-FR";
+              self.timeZoneName = @"Europe/Paris";
+              self.cpuCores = (arc4random_uniform(2) == 0) ? 6 : 4;
+
+              [self saveProfile];
+              [self applyFrenchEnvironment];
+          }
+
+          - (NSString *)buildEnvironmentJS {
+              NSTimeZone *parisTZ = [NSTimeZone timeZoneWithName:@"Europe/Paris"];
+              NSInteger secondsFromGMT = [parisTZ secondsFromGMTForDate:[NSDate date]];
+              NSInteger jsTzOffset = -(secondsFromGMT / 60);
+
+              return [NSString stringWithFormat:
+                  @"(function() {"
+                  @"  try {"
+                  @"    const cores = %ld;"
+                  @"    const tzOffset = %ld;"
+                  @"    Object.defineProperty(Navigator.prototype, 'language', { get: () => 'fr-FR', enumerable: true, configurable: true });"
+                  @"    Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['fr-FR', 'fr'], enumerable: true, configurable: true });"
+                  @"    Object.defineProperty(Navigator.prototype, 'hardwareConcurrency', { get: () => cores, enumerable: true, configurable: true });"
+                  @"    Date.prototype.getTimezoneOffset = function() { return tzOffset; };"
+                  @"    const origResolved = Intl.DateTimeFormat.prototype.resolvedOptions;"
+                  @"    Intl.DateTimeFormat.prototype.resolvedOptions = function() {"
+                  @"      const res = origResolved.apply(this, arguments);"
+                  @"      res.timeZone = 'Europe/Paris';"
+                  @"      if (!res.locale || res.locale.indexOf('fr') !== 0) res.locale = 'fr-FR';"
+                  @"      return res;"
+                  @"    };"
+                  @"  } catch (err) {}"
+                  @"})();",
+                  (long)self.cpuCores, (long)jsTzOffset];
+          }
+
+          @end
+
+          // ============================================================================
+          // 2. HOOK WKWEBVIEW & UIDEVICE
+          // ============================================================================
+          static IMP orig_WKWebView_initWithFrameConfig = NULL;
+          static IMP orig_WKWebView_setCustomUA = NULL;
+          static IMP orig_UIDevice_idfv = NULL;
+          static IMP orig_UIDevice_systemVersion = NULL;
+
+          static WKWebView* swizzled_WKWebView_initWithFrameConfig(WKWebView *self, SEL _cmd, CGRect frame, WKWebViewConfiguration *configuration) {
+              if (configuration) {
+                  if (!configuration.userContentController) {
+                      configuration.userContentController = [[WKUserContentController alloc] init];
+                  }
+                  NSString *jsCode = [[SWSpoofManager shared] buildEnvironmentJS];
+                  WKUserScript *envScript = [[WKUserScript alloc] initWithSource:jsCode
+                                                                   injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                                forMainFrameOnly:NO];
+                  [configuration.userContentController addUserScript:envScript];
+              }
+
+              WKWebView *webView = ((WKWebView* (*)(id, SEL, CGRect, WKWebViewConfiguration *))orig_WKWebView_initWithFrameConfig)(self, _cmd, frame, configuration);
+              if (webView) {
+                  NSString *spoofedUA = [SWSpoofManager shared].userAgent;
+                  if (spoofedUA.length > 0 && orig_WKWebView_setCustomUA) {
+                      ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(webView, @selector(setCustomUserAgent:), spoofedUA);
+                  }
+              }
+              return webView;
+          }
+
+          static void swizzled_WKWebView_setCustomUA(WKWebView *self, SEL _cmd, NSString *customUserAgent) {
+              NSString *spoofedUA = [SWSpoofManager shared].userAgent;
+              if (customUserAgent && [customUserAgent containsString:@"Macintosh"]) {
+                  ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(self, _cmd, customUserAgent);
+              } else if (spoofedUA.length > 0) {
+                  ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(self, _cmd, spoofedUA);
+              } else {
+                  ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(self, _cmd, customUserAgent);
+              }
+          }
+
+          static NSUUID* swizzled_UIDevice_idfv(UIDevice *self, SEL _cmd) {
+              NSString *idfvStr = [SWSpoofManager shared].idfv;
+              if (idfvStr.length > 0) {
+                  NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:idfvStr];
+                  if (uuid) return uuid;
+              }
+              return ((NSUUID* (*)(id, SEL))orig_UIDevice_idfv)(self, _cmd);
+          }
+
+          static NSString* swizzled_UIDevice_systemVersion(UIDevice *self, SEL _cmd) {
+              NSString *ver = [SWSpoofManager shared].iosVersion;
+              if (ver.length > 0) return ver;
+              return ((NSString* (*)(id, SEL))orig_UIDevice_systemVersion)(self, _cmd);
+          }
+
+          static void InstallSafariHooks(void) {
+              static dispatch_once_t onceToken;
+              dispatch_once(&onceToken, ^{
+                  Method mInit = class_getInstanceMethod([WKWebView class], @selector(initWithFrame:configuration:));
+                  if (mInit) orig_WKWebView_initWithFrameConfig = method_setImplementation(mInit, (IMP)swizzled_WKWebView_initWithFrameConfig);
+
+                  Method mSetUA = class_getInstanceMethod([WKWebView class], @selector(setCustomUserAgent:));
+                  if (mSetUA) orig_WKWebView_setCustomUA = method_setImplementation(mSetUA, (IMP)swizzled_WKWebView_setCustomUA);
+
+                  Method mIdfv = class_getInstanceMethod([UIDevice class], @selector(identifierForVendor));
+                  if (mIdfv) orig_UIDevice_idfv = method_setImplementation(mIdfv, (IMP)swizzled_UIDevice_idfv);
+
+                  Method mSysVer = class_getInstanceMethod([UIDevice class], @selector(systemVersion));
+                  if (mSysVer) orig_UIDevice_systemVersion = method_setImplementation(mSysVer, (IMP)swizzled_UIDevice_systemVersion);
+              });
+          }
+
+          // ============================================================================
+          // 3. XỬ LÝ XÓA DỮ LIỆU
+          // ============================================================================
           @interface SWFloatingWindow : UIWindow
           @property (nonatomic, strong) UIButton *fabButton;
           @end
 
           @implementation SWFloatingWindow
           - (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event {
-              if (!self.fabButton || self.fabButton.hidden || self.alpha < 0.01) return NO;
+              if (self.rootViewController && self.rootViewController.presentedViewController) {
+                  return [super pointInside:point withEvent:event];
+              }
+              if (![SWSpoofManager shared].isTouchZoneActive && ![SWSpoofManager shared].isButtonVisible) {
+                  return NO;
+              }
+              if (!self.fabButton || self.fabButton.hidden) return NO;
               CGPoint buttonPoint = [self convertPoint:point toView:self.fabButton];
               return [self.fabButton pointInside:buttonPoint withEvent:event];
           }
@@ -33,13 +254,31 @@ jobs:
           static SWFloatingWindow *gOverlayWindow = nil;
           static NSTimer *gCheckTimer = nil;
 
-          static void PerformSafariDeepWipe(BOOL shouldExitAfterWipe) {
-              dispatch_async(dispatch_get_main_queue(), ^{
-                  if (gOverlayWindow && gOverlayWindow.fabButton) {
-                      [gOverlayWindow.fabButton setTitle:@"..." forState:UIControlStateNormal];
-                      gOverlayWindow.fabButton.backgroundColor = [UIColor darkGrayColor];
-                      gOverlayWindow.fabButton.userInteractionEnabled = NO;
+          static void WipeAmazonFROnly(void (^completion)(void)) {
+              NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+              for (NSHTTPCookie *c in [cs cookies]) {
+                  if ([c.domain containsString:@"amazon"]) {
+                      [cs deleteCookie:c];
                   }
+              }
+              WKWebsiteDataStore *ds = [WKWebsiteDataStore defaultDataStore];
+              NSSet *types = [WKWebsiteDataStore allWebsiteDataTypes];
+              [ds fetchDataRecordsOfTypes:types completionHandler:^(NSArray<WKWebsiteDataRecord *> *records) {
+                  NSMutableArray *amzRecords = [NSMutableArray array];
+                  for (WKWebsiteDataRecord *rec in records) {
+                      if ([rec.displayName.lowercaseString containsString:@"amazon"]) {
+                          [amzRecords addObject:rec];
+                      }
+                  }
+                  [ds removeDataOfTypes:types forDataRecords:amzRecords completionHandler:^{
+                      [[SWSpoofManager shared] rotateProfile];
+                      if (completion) completion();
+                  }];
+              }];
+          }
+
+          static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
+              dispatch_async(dispatch_get_main_queue(), ^{
                   NSArray *secClasses = @[
                       (__bridge id)kSecClassGenericPassword,
                       (__bridge id)kSecClassInternetPassword,
@@ -53,14 +292,16 @@ jobs:
                       NSDictionary *q2 = @{(__bridge id)kSecClass: secClass};
                       SecItemDelete((__bridge CFDictionaryRef)q2);
                   }
+
                   NSHTTPCookieStorage *cs = [NSHTTPCookieStorage sharedHTTPCookieStorage];
                   for (NSHTTPCookie *c in [cs cookies]) { [cs deleteCookie:c]; }
                   [[NSURLCache sharedURLCache] removeAllCachedResponses];
+
                   NSString *bid = [[NSBundle mainBundle] bundleIdentifier];
                   if (bid) {
                       [[NSUserDefaults standardUserDefaults] removePersistentDomainForName:bid];
-                      [[NSUserDefaults standardUserDefaults] synchronize];
                   }
+
                   NSFileManager *fm = [NSFileManager defaultManager];
                   NSString *home = NSHomeDirectory();
                   NSArray *paths = @[@"Library/Caches", @"Library/Cookies", @"Library/WebKit", @"Library/Safari", @"tmp"];
@@ -71,9 +312,13 @@ jobs:
                           [fm removeItemAtPath:[full stringByAppendingPathComponent:item] error:nil];
                       }
                   }
+
+                  [[SWSpoofManager shared] rotateProfile];
+
                   if (shouldExitAfterWipe) {
                       dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ exit(0); });
                   }
+
                   NSSet *allTypes = [WKWebsiteDataStore allWebsiteDataTypes];
                   NSDate *epoch = [NSDate dateWithTimeIntervalSince1970:0];
                   [[WKWebsiteDataStore defaultDataStore] removeDataOfTypes:allTypes modifiedSince:epoch completionHandler:^{
@@ -82,9 +327,14 @@ jobs:
               });
           }
 
+          // ============================================================================
+          // 4. ĐIỀU KHIỂN NÚT TÀNG HÌNH & CỬ CHỈ 3 NGÓN TAY
+          // ============================================================================
           @interface SWFloatingController : NSObject
           + (instancetype)shared;
           - (void)tryAttachButton;
+          - (void)applyButtonAppearance;
+          - (void)showControlPanel;
           @end
 
           @implementation SWFloatingController
@@ -93,6 +343,27 @@ jobs:
               static dispatch_once_t onceToken;
               dispatch_once(&onceToken, ^{ inst = [[self alloc] init]; });
               return inst;
+          }
+
+          - (void)applyButtonAppearance {
+              if (!gOverlayWindow || !gOverlayWindow.fabButton) return;
+              UIButton *btn = gOverlayWindow.fabButton;
+              BOOL visible = [SWSpoofManager shared].isButtonVisible;
+
+              if (visible) {
+                  btn.backgroundColor = [UIColor colorWithRed:0.10 green:0.28 blue:0.68 alpha:0.92];
+                  [btn setTitle:[NSString stringWithFormat:@"FR WIPE\n%@", [SWSpoofManager shared].iosVersion] forState:UIControlStateNormal];
+                  [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+                  btn.layer.borderWidth = 2.0;
+                  btn.layer.borderColor = [UIColor whiteColor].CGColor;
+              } else {
+                  // Chế độ tàng hình: Trong suốt 100%, không chữ, không viền
+                  btn.backgroundColor = [UIColor clearColor];
+                  [btn setTitle:@"" forState:UIControlStateNormal];
+                  [btn setTitleColor:[UIColor clearColor] forState:UIControlStateNormal];
+                  btn.layer.borderWidth = 0.0;
+                  btn.layer.borderColor = [UIColor clearColor].CGColor;
+              }
           }
 
           - (void)tryAttachButton {
@@ -114,8 +385,26 @@ jobs:
                   }
               }
 
-              // Chỉ khởi tạo khi đã tìm thấy WindowScene hợp lệ của iOS 16
               if (!activeScene) return;
+
+              // Gắn cử chỉ chạm 3 ngón tay vào cửa sổ chính của Safari để mở Menu bất kỳ lúc nào
+              for (UIWindow *win in activeScene.windows) {
+                  if (![win isKindOfClass:[SWFloatingWindow class]] && win.gestureRecognizers.count < 15) {
+                      BOOL hasTripleTap = NO;
+                      for (UIGestureRecognizer *gr in win.gestureRecognizers) {
+                          if ([gr isKindOfClass:[UITapGestureRecognizer class]] && ((UITapGestureRecognizer *)gr).numberOfTouchesRequired == 3) {
+                              hasTripleTap = YES;
+                              break;
+                          }
+                      }
+                      if (!hasTripleTap) {
+                          UITapGestureRecognizer *tripleTap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(onTripleFingerTap:)];
+                          tripleTap.numberOfTouchesRequired = 3;
+                          tripleTap.numberOfTapsRequired = 1;
+                          [win addGestureRecognizer:tripleTap];
+                      }
+                  }
+              }
 
               CGRect bounds = [UIScreen mainScreen].bounds;
               gOverlayWindow = [[SWFloatingWindow alloc] initWithWindowScene:activeScene];
@@ -128,23 +417,27 @@ jobs:
               gOverlayWindow.windowLevel = UIWindowLevelAlert + 500.0;
               gOverlayWindow.hidden = NO;
 
-              CGFloat sz = 52.0;
+              CGFloat sz = 56.0;
               UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
               btn.frame = CGRectMake(bounds.size.width - sz - 12.0, 160.0, sz, sz);
-              btn.backgroundColor = [UIColor colorWithRed:0.88 green:0.12 blue:0.15 alpha:0.92];
-              [btn setTitle:@"WIPE" forState:UIControlStateNormal];
-              [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-              btn.titleLabel.font = [UIFont systemFontOfSize:12.0 weight:UIFontWeightHeavy];
+              btn.titleLabel.numberOfLines = 2;
+              btn.titleLabel.textAlignment = NSTextAlignmentCenter;
+              btn.titleLabel.font = [UIFont systemFontOfSize:10.0 weight:UIFontWeightHeavy];
               btn.layer.cornerRadius = sz / 2.0;
-              btn.layer.borderWidth = 2.0;
-              btn.layer.borderColor = [UIColor whiteColor].CGColor;
 
               [btn addTarget:self action:@selector(onWipeTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+              UILongPressGestureRecognizer *longPress = [[UILongPressGestureRecognizer alloc] initWithTarget:self action:@selector(onLongPressed:)];
+              longPress.minimumPressDuration = 0.5;
+              [btn addGestureRecognizer:longPress];
+
               UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(onPanned:)];
               [btn addGestureRecognizer:pan];
 
               [vc.view addSubview:btn];
               gOverlayWindow.fabButton = btn;
+
+              [self applyButtonAppearance];
 
               if (gCheckTimer) {
                   [gCheckTimer invalidate];
@@ -152,9 +445,89 @@ jobs:
               }
           }
 
-          - (void)onWipeTapped:(UIButton *)sender { PerformSafariDeepWipe(YES); }
+          - (void)onWipeTapped:(UIButton *)sender {
+              PerformSafariDeepWipeAndRotate(YES);
+          }
+
+          - (void)onTripleFingerTap:(UITapGestureRecognizer *)tap {
+              if (tap.state == UIGestureRecognizerStateEnded) {
+                  [self showControlPanel];
+              }
+          }
+
+          - (void)onLongPressed:(UILongPressGestureRecognizer *)lp {
+              if (lp.state == UIGestureRecognizerStateBegan) {
+                  [self showControlPanel];
+              }
+          }
+
+          - (void)showControlPanel {
+              [[WKWebsiteDataStore defaultDataStore].httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
+                  NSMutableArray *amzCookies = [NSMutableArray array];
+                  for (NSHTTPCookie *c in cookies) {
+                      if ([c.domain containsString:@"amazon.fr"] || [c.domain containsString:@"amazon."]) {
+                          [amzCookies addObject:[NSString stringWithFormat:@"%@=%@", c.name, c.value]];
+                      }
+                  }
+
+                  dispatch_async(dispatch_get_main_queue(), ^{
+                      SWSpoofManager *sm = [SWSpoofManager shared];
+                      NSString *stealthStatus = sm.isButtonVisible ? @"Đang hiện nút" : (sm.isTouchZoneActive ? @"Đang ẩn (Vùng chạm BẬT)" : @"Ẩn hoàn toàn (Chỉ dùng 3 ngón)");
+                      NSString *info = [NSString stringWithFormat:
+                          @"• Chế độ nút: %@\n"
+                          @"• Mục tiêu: amazon.fr (%@ | %@)\n"
+                          @"• iOS Spoof: %@ (%ld Cores)\n"
+                          @"• Cookie Amazon: %lu\n"
+                          @"• IDFV: %@\n\n"
+                          @"• User-Agent:\n%@",
+                          stealthStatus, sm.localeCode, sm.timeZoneName, sm.iosVersion, (long)sm.cpuCores, (unsigned long)amzCookies.count, sm.idfv, sm.userAgent];
+
+                      UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Amazon.fr Stealth (V5)"
+                                                                                     message:info
+                                                                              preferredStyle:UIAlertControllerStyleAlert];
+
+                      [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Toàn Bộ & Thoát Safari" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+                          PerformSafariDeepWipeAndRotate(YES);
+                      }]];
+
+                      [alert addAction:[UIAlertAction actionWithTitle:@"Chỉ Xóa Dữ Liệu Amazon.fr (Không thoát)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                          WipeAmazonFROnly(^{
+                              [self applyButtonAppearance];
+                          });
+                      }]];
+
+                      NSString *toggleBtnTitle = sm.isButtonVisible ? @"Ẩn nút WIPE (Chế độ Tàng hình)" : @"Hiện lại nút WIPE trên màn hình";
+                      [alert addAction:[UIAlertAction actionWithTitle:toggleBtnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                          sm.isButtonVisible = !sm.isButtonVisible;
+                          [sm saveProfile];
+                          [self applyButtonAppearance];
+                      }]];
+
+                      if (!sm.isButtonVisible) {
+                          NSString *touchZoneTitle = sm.isTouchZoneActive ? @"Tắt vùng chạm ẩn (Chỉ mở bằng 3 ngón)" : @"Bật lại vùng chạm ẩn ở mép phải";
+                          [alert addAction:[UIAlertAction actionWithTitle:touchZoneTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                              sm.isTouchZoneActive = !sm.isTouchZoneActive;
+                              [sm saveProfile];
+                          }]];
+                      }
+
+                      if (amzCookies.count > 0) {
+                          [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Copy %lu Cookie Amazon.fr", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+                              [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
+                          }]];
+                      }
+
+                      [alert addAction:[UIAlertAction actionWithTitle:@"Đóng" style:UIAlertActionStyleCancel handler:nil]];
+
+                      if (gOverlayWindow && gOverlayWindow.rootViewController) {
+                          [gOverlayWindow.rootViewController presentViewController:alert animated:YES completion:nil];
+                      }
+                  });
+              }];
+          }
 
           - (void)onPanned:(UIPanGestureRecognizer *)pan {
+              if (![SWSpoofManager shared].isButtonVisible) return;
               UIView *btn = pan.view;
               if (!btn || !btn.superview) return;
               CGPoint trans = [pan translationInView:btn.superview];
@@ -166,9 +539,12 @@ jobs:
           __attribute__((constructor))
           static void SafariWipeInit(void) {
               @autoreleasepool {
+                  [SWSpoofManager shared];
+                  InstallSafariHooks();
+
                   int token = 0;
                   notify_register_dispatch("com.custom.safari.wipe", &token, dispatch_get_main_queue(), ^(int t) {
-                      PerformSafariDeepWipe(YES);
+                      PerformSafariDeepWipeAndRotate(YES);
                   });
 
                   dispatch_async(dispatch_get_main_queue(), ^{
@@ -189,15 +565,52 @@ jobs:
           open("SafariWipe.m", "w").write(code)
           '
 
-      - name: Compile and Sign with ldid
+      - name: Compile and Package DEB
         run: |
-          brew install ldid
+          brew install ldid dpkg
           SDK_PATH=$(xcrun --sdk iphoneos --show-sdk-path)
-          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 -Wno-deprecated-declarations -install_name /var/jb/Library/MobileSubstrate/DynamicLibraries/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics SafariWipe.m -o SafariWipe.dylib
+          xcrun -sdk iphoneos clang -arch arm64 -arch arm64e -dynamiclib -fobjc-arc -isysroot "$SDK_PATH" -miphoneos-version-min=14.0 -Wno-deprecated-declarations -install_name @rpath/SafariWipe.dylib -framework Foundation -framework UIKit -framework WebKit -framework Security -framework QuartzCore -framework CoreGraphics SafariWipe.m -o SafariWipe.dylib
           ldid -S SafariWipe.dylib
+
+          mkdir -p pkg/DEBIAN
+          mkdir -p pkg/Library/MobileSubstrate/DynamicLibraries
+          cp SafariWipe.dylib pkg/Library/MobileSubstrate/DynamicLibraries/
+          chmod 0755 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.dylib
+
+          python3 -c '
+          plist = """<?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>Filter</key>
+            <dict>
+              <key>Bundles</key>
+              <array>
+                <string>com.apple.mobilesafari</string>
+              </array>
+            </dict>
+          </dict>
+          </plist>"""
+          open("pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist", "w").write(plist)
+          control = """Package: com.custom.safariwipe
+          Name: SafariWipe Stealth V5
+          Version: 5.0.0
+          Architecture: iphoneos-arm
+          Description: Stealth Deep Wipe + French Profile Manager for Safari
+          Maintainer: Custom
+          Author: Custom
+          Section: Tweaks
+          Depends: mobilesubstrate
+          """
+          open("pkg/DEBIAN/control", "w").write(control)
+          '
+          chmod 0644 pkg/Library/MobileSubstrate/DynamicLibraries/SafariWipe.plist
+          dpkg-deb -Zgzip -b pkg SafariWipe.deb
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: SafariWipe-dylib
-          path: SafariWipe.dylib
+          name: SafariWipe-V5-Stealth
+          path: |
+            SafariWipe.deb
+            SafariWipe.dylib
