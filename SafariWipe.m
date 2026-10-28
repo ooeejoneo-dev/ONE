@@ -12,6 +12,7 @@
 #import <signal.h>
 #import <unistd.h>
 #import <stdlib.h>
+#import <sys/wait.h>
 
 extern char **environ;
 
@@ -56,7 +57,22 @@ static NSSet<WKWebView *> *GetAllActiveSafariWebViews(void) {
     return all;
 }
 
-// Diệt cả tiến trình WebKit ngầm lẫn tiến trình swcd (SharedWebCredentials giữ trạng thái ẩn Smart App Banner)
+static void RunCommandAndWait(const char *binCandidates[], char *const argv[]) {
+    const char *binPath = NULL;
+    for (int i = 0; binCandidates[i] != NULL; i++) {
+        if (access(binCandidates[i], X_OK) == 0) {
+            binPath = binCandidates[i];
+            break;
+        }
+    }
+    if (!binPath) return;
+    pid_t pid = 0;
+    if (posix_spawn(&pid, binPath, NULL, NULL, argv, environ) == 0 && pid > 0) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+    }
+}
+
 static void KillBackgroundWebKitDaemons(void) {
     const char *killallPaths[] = {
         "/var/jb/usr/bin/killall",
@@ -104,18 +120,16 @@ static void KillBackgroundWebKitDaemons(void) {
 @property (nonatomic, assign) NSInteger canvasSeed;
 @property (nonatomic, assign) BOOL isButtonVisible;
 @property (nonatomic, assign) BOOL forceAppBanner;
-@property (nonatomic, assign) BOOL isRecording;
-@property (nonatomic, assign) NSUInteger stepCount;
-@property (nonatomic, copy) NSString *sessionDir;
+@property (nonatomic, copy) NSString *pendingRestoreWebStorageJSON;
+@property (nonatomic, copy) NSString *pendingRestoreURL;
 
 + (instancetype)shared;
+- (NSString *)profilePath;
+- (void)loadOrGenerateProfile;
 - (void)rotateProfile;
 - (void)saveProfile;
 - (NSString *)buildEnvironmentJS;
 - (void)injectIntoUserContentController:(WKUserContentController *)ucc;
-- (void)startRecordingSession;
-- (NSString *)stopRecordingSession;
-- (void)recordStepWithType:(NSString *)type url:(NSString *)url;
 @end
 
 @implementation SWSpoofManager
@@ -167,6 +181,8 @@ static void KillBackgroundWebKitDaemons(void) {
         self.canvasSeed = [dict[@"canvasSeed"] integerValue] ?: 582913;
         self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
         self.forceAppBanner = dict[@"forceAppBanner"] ? [dict[@"forceAppBanner"] boolValue] : YES;
+        self.pendingRestoreWebStorageJSON = dict[@"pendingRestoreWebStorageJSON"];
+        self.pendingRestoreURL = dict[@"pendingRestoreURL"];
     } else {
         self.isButtonVisible = dict[@"isButtonVisible"] ? [dict[@"isButtonVisible"] boolValue] : YES;
         self.forceAppBanner = dict[@"forceAppBanner"] ? [dict[@"forceAppBanner"] boolValue] : YES;
@@ -175,7 +191,7 @@ static void KillBackgroundWebKitDaemons(void) {
 }
 
 - (void)saveProfile {
-    NSDictionary *dict = @{
+    NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithDictionary:@{
         @"userAgent": self.userAgent ?: @"",
         @"iosVersion": self.iosVersion ?: @"16.6",
         @"idfv": self.idfv ?: [[NSUUID UUID] UUIDString],
@@ -192,7 +208,9 @@ static void KillBackgroundWebKitDaemons(void) {
         @"canvasSeed": @(self.canvasSeed),
         @"isButtonVisible": @(self.isButtonVisible),
         @"forceAppBanner": @(self.forceAppBanner)
-    };
+    }];
+    if (self.pendingRestoreWebStorageJSON) dict[@"pendingRestoreWebStorageJSON"] = self.pendingRestoreWebStorageJSON;
+    if (self.pendingRestoreURL) dict[@"pendingRestoreURL"] = self.pendingRestoreURL;
     [dict writeToFile:[self profilePath] atomically:YES];
 }
 
@@ -238,6 +256,8 @@ static void KillBackgroundWebKitDaemons(void) {
     NSInteger newSeed = (NSInteger)(arc4random_uniform(899999) + 100000);
     if (newSeed == self.canvasSeed) newSeed += 7;
     self.canvasSeed = newSeed;
+    self.pendingRestoreWebStorageJSON = nil;
+    self.pendingRestoreURL = nil;
 
     [self saveProfile];
 }
@@ -425,57 +445,37 @@ static void KillBackgroundWebKitDaemons(void) {
     [ucc addUserScript:envScript];
 }
 
-- (void)startRecordingSession {
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"yyyyMMdd_HHmmss";
-    NSString *folderName = [NSString stringWithFormat:@"session_%@", [df stringFromDate:[NSDate date]]];
-    NSString *baseDir = [[NSHomeDirectory() stringByAppendingPathComponent:@"Documents/FWAmzSteps"] stringByAppendingPathComponent:folderName];
-    [[NSFileManager defaultManager] createDirectoryAtPath:baseDir withIntermediateDirectories:YES attributes:nil error:nil];
-    self.sessionDir = baseDir;
-    self.stepCount = 0;
-    self.isRecording = YES;
-}
-
-- (NSString *)stopRecordingSession {
-    self.isRecording = NO;
-    return self.sessionDir ?: @"";
-}
-
-- (void)recordStepWithType:(NSString *)type url:(NSString *)url {
-    if (!self.isRecording || !self.sessionDir || !url) return;
-    self.stepCount++;
-    NSUInteger idx = self.stepCount;
-    NSString *dir = self.sessionDir;
-
-    [[WKWebsiteDataStore defaultDataStore].httpCookieStore getAllCookies:^(NSArray<NSHTTPCookie *> *cookies) {
-        NSMutableDictionary *cookieDict = [NSMutableDictionary dictionary];
-        for (NSHTTPCookie *c in cookies) {
-            cookieDict[c.name] = c.value;
-        }
-        NSDictionary *stepData = @{
-            @"step": @(idx),
-            @"type": type ?: @"NAV",
-            @"url": url,
-            @"timestamp": [[NSDate date] description],
-            @"cookies_after": cookieDict
-        };
-        NSData *json = [NSJSONSerialization dataWithJSONObject:stepData options:NSJSONWritingPrettyPrinted error:nil];
-        NSString *fileName = [NSString stringWithFormat:@"%03lu_%@.json", (unsigned long)idx, type];
-        [json writeToFile:[dir stringByAppendingPathComponent:fileName] atomically:YES];
-    }];
-}
-
 @end
 
-static void CollectAllSafariCookies(void (^completion)(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies)) {
+// ============================================================================
+// THU THẬP COOKIE ĐA TẦNG (TRẢ VỀ CẢ ĐỐI TƯỢNG NSHTTPCookie ĐẦY ĐỦ THUỘC TÍNH)
+// ============================================================================
+static void CollectAllSafariCookiesDetailed(void (^completion)(NSArray<NSString *> *amzPairs, NSArray<NSString *> *allPairs, NSArray<NSDictionary *> *cookieDicts)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableDictionary<NSString *, NSString *> *amzMap = [NSMutableDictionary dictionary];
         NSMutableDictionary<NSString *, NSString *> *allMap = [NSMutableDictionary dictionary];
+        NSMutableDictionary<NSString *, NSDictionary *> *rawPropMap = [NSMutableDictionary dictionary];
 
         void (^addCookieObj)(NSHTTPCookie *) = ^(NSHTTPCookie *c) {
             if (!c || !c.name || !c.value) return;
             NSString *pair = [NSString stringWithFormat:@"%@=%@", c.name, c.value];
             allMap[c.name] = pair;
+
+            NSMutableDictionary *props = [NSMutableDictionary dictionary];
+            props[NSHTTPCookieName] = c.name;
+            props[NSHTTPCookieValue] = c.value;
+            props[NSHTTPCookieDomain] = c.domain ?: @".amazon.fr";
+            props[NSHTTPCookiePath] = c.path ?: @"/";
+            if (c.expiresDate) {
+                props[NSHTTPCookieExpires] = c.expiresDate;
+            } else {
+                props[NSHTTPCookieExpires] = [NSDate dateWithTimeIntervalSinceNow:86400 * 365];
+            }
+            if (c.isSecure) props[NSHTTPCookieSecure] = @"TRUE";
+
+            NSString *uniqueKey = [NSString stringWithFormat:@"%@|%@|%@", c.domain ?: @"", c.path ?: @"/", c.name];
+            rawPropMap[uniqueKey] = props;
+
             NSString *dom = (c.domain ?: @"").lowercaseString;
             NSString *nam = c.name.lowercaseString;
             if ([dom containsString:@"amazon"] ||
@@ -520,7 +520,7 @@ static void CollectAllSafariCookies(void (^completion)(NSArray<NSString *> *amzC
 
         for (WKWebView *wv in webViews) {
             dispatch_group_enter(grp);
-            NSString *currentHost = (wv.URL.host ?: @"").lowercaseString;
+            NSString *currentHost = (wv.URL.host ?: @".amazon.fr").lowercaseString;
             [wv evaluateJavaScript:@"document.cookie" completionHandler:^(id result, NSError *error) {
                 dispatch_async(dispatch_get_main_queue(), ^{
                     if ([result isKindOfClass:[NSString class]]) {
@@ -531,7 +531,22 @@ static void CollectAllSafariCookies(void (^completion)(NSArray<NSString *> *amzC
                             NSRange eq = [trimmed rangeOfString:@"="];
                             if (eq.location != NSNotFound && eq.location > 0) {
                                 NSString *k = [trimmed substringToIndex:eq.location];
+                                NSString *v = [trimmed substringFromIndex:eq.location + 1];
                                 allMap[k] = trimmed;
+
+                                NSString *dom = [currentHost containsString:@"amazon"] ? @".amazon.fr" : (currentHost.length > 0 ? currentHost : @".amazon.fr");
+                                NSString *uKey = [NSString stringWithFormat:@"%@|/|%@", dom, k];
+                                if (!rawPropMap[uKey]) {
+                                    rawPropMap[uKey] = @{
+                                        NSHTTPCookieName: k,
+                                        NSHTTPCookieValue: v ?: @"",
+                                        NSHTTPCookieDomain: dom,
+                                        NSHTTPCookiePath: @"/",
+                                        NSHTTPCookieExpires: [NSDate dateWithTimeIntervalSinceNow:86400 * 365],
+                                        NSHTTPCookieSecure: @"TRUE"
+                                    };
+                                }
+
                                 NSString *kLow = k.lowercaseString;
                                 if ([currentHost containsString:@"amazon"] ||
                                     [kLow hasSuffix:@"acbfr"] ||
@@ -553,13 +568,248 @@ static void CollectAllSafariCookies(void (^completion)(NSArray<NSString *> *amzC
             if (didCallback) return;
             didCallback = YES;
             if (completion) {
-                completion([amzMap allValues], [allMap allValues]);
+                completion([amzMap allValues], [allMap allValues], [rawPropMap allValues]);
             }
         };
 
         dispatch_group_notify(grp, dispatch_get_main_queue(), finishBlock);
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)), dispatch_get_main_queue(), finishBlock);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.65 * NSEC_PER_SEC)), dispatch_get_main_queue(), finishBlock);
     });
+}
+
+// ============================================================================
+// QUẢN LÝ SAO LƯU & KHÔI PHỤC TOÀN DIỆN (BACKUP & RESTORE MANAGER)
+// ============================================================================
+static NSString *GetSafariBackupRootDirectory(void) {
+    NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/SafariBackups"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSArray<NSString *> *ListAvailableBackups(void) {
+    NSString *root = GetSafariBackupRootDirectory();
+    NSArray<NSString *> *items = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:root error:nil];
+    if (!items) return @[];
+    NSMutableArray<NSString *> *valid = [NSMutableArray array];
+    for (NSString *item in items) {
+        if ([item hasPrefix:@"BK_"]) {
+            [valid addObject:item];
+        }
+    }
+    [valid sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+        return [b compare:a]; // Mới nhất lên đầu
+    }];
+    return valid;
+}
+
+static void CloseAllSafariOpenTabsInRAM(void);
+static void PurgeSafariDiskStorage(void);
+static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe);
+
+static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup, void (^doneBlock)(NSString *folderPath, NSUInteger cookieCount)) {
+    CollectAllSafariCookiesDetailed(^(NSArray<NSString *> *amzPairs, NSArray<NSString *> *allPairs, NSArray<NSDictionary *> *cookieDicts) {
+        SWSpoofManager *sm = [SWSpoofManager shared];
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyyMMdd_HHmmss";
+        NSString *timeStr = [df stringFromDate:[NSDate date]];
+
+        // Làm sạch nhãn ghi chú
+        NSString *cleanTag = [[customLabel ?: @"" componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@"_"];
+        if (cleanTag.length == 0) {
+            cleanTag = [NSString stringWithFormat:@"%@_%@", sm.iosVersion ?: @"16.6", [sm.serial substringToIndex:MIN((NSUInteger)6, sm.serial.length)]];
+        }
+
+        NSString *folderName = [NSString stringWithFormat:@"BK_%@_%@_%luC", timeStr, cleanTag, (unsigned long)cookieDicts.count];
+        NSString *targetDir = [GetSafariBackupRootDirectory() stringByAppendingPathComponent:folderName];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        [fm createDirectoryAtPath:targetDir withIntermediateDirectories:YES attributes:nil error:nil];
+
+        // 1. Lưu cấu hình Spoof Profile hiện tại
+        [sm saveProfile];
+        [fm copyItemAtPath:[sm profilePath] toPath:[targetDir stringByAppendingPathComponent:@"_spoof_profile.plist"] error:nil];
+
+        // 2. Lưu mảng NSHTTPCookie đầy đủ thuộc tính (bao gồm HttpOnly)
+        [cookieDicts writeToFile:[targetDir stringByAppendingPathComponent:@"_cookies_full.plist"] atomically:YES];
+
+        // 3. Lưu chuỗi Cookie dạng text dễ copy
+        NSString *amzTxt = [amzPairs componentsJoinedByString:@"; "];
+        NSString *allTxt = [allPairs componentsJoinedByString:@"; "];
+        [(amzTxt.length > 0 ? amzTxt : allTxt) writeToFile:[targetDir stringByAppendingPathComponent:@"_cookies_header.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+        // 4. Trích xuất localStorage, sessionStorage và URL từ WKWebView đang mở
+        NSSet<WKWebView *> *webViews = GetAllActiveSafariWebViews();
+        WKWebView *activeWV = [webViews anyObject];
+        for (WKWebView *wv in webViews) {
+            if ([wv.URL.host.lowercaseString containsString:@"amazon"]) {
+                activeWV = wv;
+                break;
+            }
+        }
+
+        void (^finishDiskArchive)(NSString *, NSString *) = ^(NSString *webStorageJSON, NSString *currentURL) {
+            if (webStorageJSON.length > 0) {
+                [webStorageJSON writeToFile:[targetDir stringByAppendingPathComponent:@"_webstorage.json"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
+            }
+            NSDictionary *meta = @{
+                @"backup_name": folderName,
+                @"created_at": [[NSDate date] description],
+                @"url": currentURL ?: @"https://www.amazon.fr/",
+                @"ios_version": sm.iosVersion ?: @"",
+                @"user_agent": sm.userAgent ?: @"",
+                @"idfv": sm.idfv ?: @"",
+                @"idfa": sm.idfa ?: @"",
+                @"serial": sm.serial ?: @"",
+                @"canvas_seed": @(sm.canvasSeed),
+                @"carrier": sm.carrierName ?: @"",
+                @"amz_cookie_count": @(amzPairs.count),
+                @"total_cookie_count": @(cookieDicts.count)
+            };
+            NSData *metaData = [NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingPrettyPrinted error:nil];
+            [metaData writeToFile:[targetDir stringByAppendingPathComponent:@"_meta.json"] atomically:YES];
+
+            // 5. Nén thêm thư mục Library/Cookies, Library/WebKit, Library/Safari trên đĩa
+            NSString *tarFile = [targetDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
+            const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
+            char *tarArgv[] = {
+                (char *)"tar",
+                (char *)"-czf",
+                (char *)[tarFile UTF8String],
+                (char *)"-C",
+                (char *)[NSHomeDirectory() UTF8String],
+                (char *)"Library/Cookies",
+                (char *)"Library/WebKit",
+                (char *)"Library/Safari",
+                NULL
+            };
+            RunCommandAndWait(tarBins, tarArgv);
+
+            // Copyパス vào Clipboard để AutoTouch / người dùng dễ kiểm tra
+            [UIPasteboard generalPasteboard].string = targetDir;
+
+            if (doneBlock) {
+                doneBlock(targetDir, cookieDicts.count);
+            }
+            if (wipeAfterBackup) {
+                PerformSafariDeepWipeAndRotate(YES);
+            }
+        };
+
+        if (activeWV) {
+            NSString *curURL = activeWV.URL.absoluteString ?: @"https://www.amazon.fr/";
+            NSString *dumpJS = @"(function(){try{var ls={},ss={};for(var i=0;i<localStorage.length;i++){var k=localStorage.key(i);ls[k]=localStorage.getItem(k);}for(var j=0;j<sessionStorage.length;j++){var k2=sessionStorage.key(j);ss[k2]=sessionStorage.getItem(k2);}return JSON.stringify({ls:ls,ss:ss});}catch(e){return '';}})();";
+            [activeWV evaluateJavaScript:dumpJS completionHandler:^(id res, NSError *err) {
+                NSString *jsonStr = [res isKindOfClass:[NSString class]] ? (NSString *)res : @"";
+                finishDiskArchive(jsonStr, curURL);
+            }];
+        } else {
+            finishDiskArchive(@"", @"https://www.amazon.fr/");
+        }
+    });
+}
+
+static void PerformFullSafariRestore(NSString *backupFolderName) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSString *sourceDir = [GetSafariBackupRootDirectory() stringByAppendingPathComponent:backupFolderName];
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:sourceDir]) return;
+
+        // 1. Đóng toàn bộ Tab hiện tại và xóa sạch dữ liệu phiên cũ
+        CloseAllSafariOpenTabsInRAM();
+        PurgeSafariDiskStorage();
+
+        // 2. Khôi phục file cấu hình Spoof Profile (IDFV, Serial, Canvas Seed, UA)
+        NSString *savedSpoofPath = [sourceDir stringByAppendingPathComponent:@"_spoof_profile.plist"];
+        NSString *activeSpoofPath = [[SWSpoofManager shared] profilePath];
+        if ([fm fileExistsAtPath:savedSpoofPath]) {
+            [fm removeItemAtPath:activeSpoofPath error:nil];
+            [fm copyItemAtPath:savedSpoofPath toPath:activeSpoofPath error:nil];
+            [[SWSpoofManager shared] loadOrGenerateProfile];
+        }
+
+        // Đọc _webstorage.json và _meta.json để tự động bơm lại vào trang khi mở Safari
+        NSString *wsPath = [sourceDir stringByAppendingPathComponent:@"_webstorage.json"];
+        NSString *wsJSON = [NSString stringWithContentsOfFile:wsPath encoding:NSUTF8StringEncoding error:nil];
+        NSData *metaData = [NSData dataWithContentsOfFile:[sourceDir stringByAppendingPathComponent:@"_meta.json"]];
+        NSDictionary *meta = metaData ? [NSJSONSerialization JSONObjectWithData:metaData options:0 error:nil] : nil;
+        NSString *restoreURL = meta[@"url"] ?: @"https://www.amazon.fr/";
+
+        [SWSpoofManager shared].pendingRestoreWebStorageJSON = wsJSON;
+        [SWSpoofManager shared].pendingRestoreURL = restoreURL;
+        [[SWSpoofManager shared] saveProfile];
+
+        // 3. Giải nén lại thư mục Library/Cookies, Library/WebKit, Library/Safari
+        NSString *tarFile = [sourceDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
+        if ([fm fileExistsAtPath:tarFile]) {
+            const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
+            char *tarArgv[] = {
+                (char *)"tar",
+                (char *)"-xzf",
+                (char *)[tarFile UTF8String],
+                (char *)"-C",
+                (char *)[NSHomeDirectory() UTF8String],
+                NULL
+            };
+            RunCommandAndWait(tarBins, tarArgv);
+        }
+
+        // 4. Nạp lại toàn bộ đối tượng NSHTTPCookie vào cả NSHTTPCookieStorage lẫn WKHTTPCookieStore
+        NSString *cookiesPlist = [sourceDir stringByAppendingPathComponent:@"_cookies_full.plist"];
+        NSArray<NSDictionary *> *cookieDicts = [NSArray arrayWithContentsOfFile:cookiesPlist];
+        WKHTTPCookieStore *wkStore = [WKWebsiteDataStore defaultDataStore].httpCookieStore;
+        NSHTTPCookieStorage *nsStore = [NSHTTPCookieStorage sharedHTTPCookieStorage];
+
+        dispatch_group_t grp = dispatch_group_create();
+        for (NSDictionary *props in cookieDicts) {
+            NSHTTPCookie *cookie = [NSHTTPCookie cookieWithProperties:props];
+            if (cookie) {
+                [nsStore setCookie:cookie];
+                dispatch_group_enter(grp);
+                [wkStore setCookie:cookie completionHandler:^{
+                    dispatch_group_leave(grp);
+                }];
+            }
+        }
+
+        // Sau khi nạp xong Cookie vào Store thì đóng Safari để khởi động sạch với Profile vừa Restore
+        dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                _exit(0);
+            });
+        });
+    });
+}
+
+// Tự động nạp lại Cookie và WebStorage sau khi vừa Restore và mở lại Safari
+static void CheckAndApplyPendingRestoreIfNeeded(WKWebView *webView) {
+    SWSpoofManager *sm = [SWSpoofManager shared];
+    if (!sm.pendingRestoreURL && !sm.pendingRestoreWebStorageJSON) return;
+
+    NSString *wsJSON = sm.pendingRestoreWebStorageJSON;
+    NSString *targetURL = sm.pendingRestoreURL;
+
+    // Xóa cờ chờ để chỉ chạy 1 lần duy nhất
+    sm.pendingRestoreWebStorageJSON = nil;
+    sm.pendingRestoreURL = nil;
+    [sm saveProfile];
+
+    if (wsJSON.length > 2 && webView.configuration.userContentController) {
+        NSString *restoreJS = [NSString stringWithFormat:
+            @"(function(){try{var d=%@;if(d&&d.ls){for(var k in d.ls){localStorage.setItem(k,d.ls[k]);}}if(d&&d.ss){for(var k2 in d.ss){sessionStorage.setItem(k2,d.ss[k2]);}}}catch(e){}})();",
+            wsJSON];
+        WKUserScript *wsScript = [[WKUserScript alloc] initWithSource:restoreJS
+                                                        injectionTime:WKUserScriptInjectionTimeAtDocumentStart
+                                                     forMainFrameOnly:YES];
+        [webView.configuration.userContentController addUserScript:wsScript];
+    }
+
+    if (targetURL.length > 0) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            NSURL *u = [NSURL URLWithString:targetURL];
+            if (u) {
+                [webView loadRequest:[NSURLRequest requestWithURL:u]];
+            }
+        });
+    }
 }
 
 static IMP orig_WKWebView_initWithFrameConfig = NULL;
@@ -584,6 +834,7 @@ static WKWebView* swizzled_WKWebView_initWithFrameConfig(WKWebView *self, SEL _c
         if (spoofedUA.length > 0 && orig_WKWebView_setCustomUA) {
             ((void (*)(id, SEL, NSString *))orig_WKWebView_setCustomUA)(webView, @selector(setCustomUserAgent:), spoofedUA);
         }
+        CheckAndApplyPendingRestoreIfNeeded(webView);
     }
     return webView;
 }
@@ -608,9 +859,6 @@ static void swizzled_WKWebView_setCustomUA(WKWebView *self, SEL _cmd, NSString *
 static WKNavigation* swizzled_WKWebView_loadRequest(WKWebView *self, SEL _cmd, NSURLRequest *request) {
     TrackWebView(self);
     [[SWSpoofManager shared] injectIntoUserContentController:self.configuration.userContentController];
-    if ([SWSpoofManager shared].isRecording && request.URL.absoluteString) {
-        [[SWSpoofManager shared] recordStepWithType:@"WEB_NAV" url:request.URL.absoluteString];
-    }
     return ((WKNavigation* (*)(id, SEL, NSURLRequest *))orig_WKWebView_loadRequest)(self, _cmd, request);
 }
 
@@ -898,6 +1146,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
 - (void)tryAttachButton;
 - (void)applyButtonAppearance;
 - (void)showMainPanel;
+- (void)showBackupManagerMenu;
 @end
 
 @implementation SWFloatingController
@@ -1022,6 +1271,136 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     }
 }
 
+// ============================================================================
+// MENU QUẢN LÝ SAO LƯU & KHÔI PHỤC (BACKUP & RESTORE SUB-MENU)
+// ============================================================================
+- (void)promptCustomLabelAndBackupWithWipe:(BOOL)wipeAfter {
+    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:wipeAfter ? @"Sao lưu & Wipe sang máy mới" : @"Sao lưu toàn bộ phiên hiện tại"
+                                                                    message:@"Nhập tên gợi nhớ (VD: AccPhap01, Mail...) hoặc để trống để tự đặt theo Serial:"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+    [prompt addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.placeholder = @"Tên phiên sao lưu (tùy chọn)";
+    }];
+
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Bắt đầu Sao lưu" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *tag = prompt.textFields.firstObject.text;
+        PerformFullSafariBackup(tag, wipeAfter, ^(NSString *folderPath, NSUInteger cookieCount) {
+            if (!wipeAfter && gOverlayWindow && gOverlayWindow.rootViewController) {
+                NSString *shortName = [folderPath lastPathComponent];
+                UIAlertController *doneAlert = [UIAlertController alertControllerWithTitle:@"Đã Sao Lưu Thành Công!"
+                                                                                   message:[NSString stringWithFormat:@"• Gói: %@\n• Đã lưu: %lu Cookies + LocalStorage + Hồ sơ máy (%@)\n• Đường dẫn đã được Copy vào bộ nhớ tạm.", shortName, (unsigned long)cookieCount, [SWSpoofManager shared].iosVersion]
+                                                                            preferredStyle:UIAlertControllerStyleAlert];
+                [doneAlert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+                [gOverlayWindow.rootViewController presentViewController:doneAlert animated:YES completion:nil];
+            }
+        });
+    }]];
+
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    if (gOverlayWindow && gOverlayWindow.rootViewController) {
+        [gOverlayWindow.rootViewController presentViewController:prompt animated:YES completion:nil];
+    }
+}
+
+- (void)showActionForSingleBackup:(NSString *)folderName {
+    NSString *fullPath = [GetSafariBackupRootDirectory() stringByAppendingPathComponent:folderName];
+    NSData *metaData = [NSData dataWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"_meta.json"]];
+    NSDictionary *meta = metaData ? [NSJSONSerialization JSONObjectWithData:metaData options:0 error:nil] : @{};
+
+    NSString *info = [NSString stringWithFormat:
+        @"• Gói: %@\n"
+        @"• Thời gian: %@\n"
+        @"• iOS: %@ | Serial: %@\n"
+        @"• Seed: #%@ | Nhà mạng: %@\n"
+        @"• Cookie Amazon: %@ | Tổng: %@\n"
+        @"• URL: %@",
+        folderName,
+        meta[@"created_at"] ?: @"N/A",
+        meta[@"ios_version"] ?: @"16.6",
+        meta[@"serial"] ?: @"N/A",
+        meta[@"canvas_seed"] ?: @"N/A",
+        meta[@"carrier"] ?: @"Orange F",
+        meta[@"amz_cookie_count"] ?: @0,
+        meta[@"total_cookie_count"] ?: @0,
+        meta[@"url"] ?: @"https://www.amazon.fr/"];
+
+    UIAlertController *sub = [UIAlertController alertControllerWithTitle:@"Chi tiết Bản Sao Lưu"
+                                                                 message:info
+                                                          preferredStyle:UIAlertControllerStyleAlert];
+
+    [sub addAction:[UIAlertAction actionWithTitle:@"Khôi phục (Restore) phiên này & Mở lại" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        PerformFullSafariRestore(folderName);
+    }]];
+
+    [sub addAction:[UIAlertAction actionWithTitle:@"Copy chuỗi Cookie của bản này" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *cTxt = [NSString stringWithContentsOfFile:[fullPath stringByAppendingPathComponent:@"_cookies_header.txt"] encoding:NSUTF8StringEncoding error:nil];
+        if (cTxt.length > 0) {
+            [UIPasteboard generalPasteboard].string = cTxt;
+        }
+    }]];
+
+    [sub addAction:[UIAlertAction actionWithTitle:@"Copy đường dẫn thư mục" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [UIPasteboard generalPasteboard].string = fullPath;
+    }]];
+
+    [sub addAction:[UIAlertAction actionWithTitle:@"Xóa bản sao lưu này" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [[NSFileManager defaultManager] removeItemAtPath:fullPath error:nil];
+        [self showBackupManagerMenu];
+    }]];
+
+    [sub addAction:[UIAlertAction actionWithTitle:@"Quay lại" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        [self showBackupManagerMenu];
+    }]];
+
+    if (gOverlayWindow && gOverlayWindow.rootViewController) {
+        [gOverlayWindow.rootViewController presentViewController:sub animated:YES completion:nil];
+    }
+}
+
+- (void)showBackupManagerMenu {
+    NSArray<NSString *> *backups = ListAvailableBackups();
+    NSString *msg = [NSString stringWithFormat:@"Thư mục: Documents/SafariBackups\nHiện có: %lu bản sao lưu toàn diện (Cookies + LocalStorage + Disk + Hồ sơ phần cứng)", (unsigned long)backups.count];
+
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu Sao Lưu & Khôi Phục (V7.1)"
+                                                                  message:msg
+                                                           preferredStyle:UIAlertControllerStyleAlert];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"[+] Sao lưu phiên hiện tại (Giữ nguyên)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self promptCustomLabelAndBackupWithWipe:NO];
+    }]];
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"[+] Sao lưu xong & Tự động WIPE sang máy mới" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [self promptCustomLabelAndBackupWithWipe:YES];
+    }]];
+
+    // Hiển thị danh sách 10 bản sao lưu gần nhất để chọn Restore ngay
+    NSUInteger limit = MIN(backups.count, (NSUInteger)10);
+    for (NSUInteger i = 0; i < limit; i++) {
+        NSString *folderName = backups[i];
+        NSString *btnTitle = [NSString stringWithFormat:@"Restore: %@", folderName];
+        [menu addAction:[UIAlertAction actionWithTitle:btnTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self showActionForSingleBackup:folderName];
+        }]];
+    }
+
+    if (backups.count > 0) {
+        [menu addAction:[UIAlertAction actionWithTitle:@"Xóa tất cả các bản sao lưu cũ" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            NSString *root = GetSafariBackupRootDirectory();
+            for (NSString *b in backups) {
+                [[NSFileManager defaultManager] removeItemAtPath:[root stringByAppendingPathComponent:b] error:nil];
+            }
+        }]];
+    }
+
+    [menu addAction:[UIAlertAction actionWithTitle:@"Quay lại Menu chính" style:UIAlertActionStyleCancel handler:^(UIAlertAction *a) {
+        [self showMainPanel];
+    }]];
+
+    if (gOverlayWindow && gOverlayWindow.rootViewController) {
+        [gOverlayWindow.rootViewController presentViewController:menu animated:YES completion:nil];
+    }
+}
+
 - (void)copyDiagnosticReportWithAmzCookies:(NSArray<NSString *> *)amzCookies allCookies:(NSArray<NSString *> *)allCookies {
     SWSpoofManager *sm = [SWSpoofManager shared];
     CGRect scr = [UIScreen mainScreen].bounds;
@@ -1031,7 +1410,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     NSArray<NSString *> *targetCookies = amzCookies.count > 0 ? amzCookies : allCookies;
     NSString *cookieBlock = targetCookies.count > 0 ? [targetCookies componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V7.0 DIAGNOSTIC (iOS 16.6+ & BANNER) ===\n"
+        @"=== SAFARI V7.1 DIAGNOSTIC (BACKUP SUITE) ===\n"
         @"Time: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
@@ -1063,8 +1442,9 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
 }
 
 - (void)showMainPanel {
-    CollectAllSafariCookies(^(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies) {
+    CollectAllSafariCookiesDetailed(^(NSArray<NSString *> *amzCookies, NSArray<NSString *> *allCookies, NSArray<NSDictionary *> *cookieDicts) {
         SWSpoofManager *sm = [SWSpoofManager shared];
+        NSArray<NSString *> *savedBackups = ListAvailableBackups();
         NSString *bannerState = sm.forceAppBanner ? @"ĐANG BẬT (AutoTouch Ready)" : @"Đang tắt";
         NSString *msg = [NSString stringWithFormat:
             @"• Nhánh UA: iOS %@ (%ld Cores)\n"
@@ -1072,6 +1452,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             @"• Vùng: %@ | %@\n"
             @"• Nhà mạng: %@ (%@-%@)\n"
             @"• Cookie Amazon: %lu | Tổng Cookie: %lu\n"
+            @"• Kho Backup: %lu bản đã lưu\n"
             @"• Banner Open: %@\n"
             @"• Serial: %@ | IDFV:\n%@\n\n"
             @"• User-Agent:\n%@",
@@ -1080,15 +1461,24 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             sm.localeCode, sm.timeZoneName,
             sm.carrierName, sm.carrierMCC, sm.carrierMNC,
             (unsigned long)amzCookies.count, (unsigned long)allCookies.count,
+            (unsigned long)savedBackups.count,
             bannerState,
             sm.serial, sm.idfv,
             sm.userAgent];
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.0 (iOS 16.6+ & Banner)"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.1 (Backup Suite)"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + swcd & Đổi Máy (16.6+)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Sao Lưu & Khôi Phục Full (%lu bản)", (unsigned long)savedBackups.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self showBackupManagerMenu];
+        }]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Sao Lưu Nhanh & WIPE Sang Máy Mới" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+            PerformFullSafariBackup(@"AutoRun", YES, nil);
+        }]];
+
+        [alert addAction:[UIAlertAction actionWithTitle:@"Wipe Sạch Tab + swcd & Đổi Máy (Không lưu)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
             PerformSafariDeepWipeAndRotate(YES);
         }]];
 
@@ -1098,20 +1488,14 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             [sm saveProfile];
         }]];
 
-        [alert addAction:[UIAlertAction actionWithTitle:@"Info: Copy Diagnostic Report" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            [self copyDiagnosticReportWithAmzCookies:amzCookies allCookies:allCookies];
-        }]];
-
         if (amzCookies.count > 0) {
             [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy Amazon.fr (%lu)", (unsigned long)amzCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
                 [UIPasteboard generalPasteboard].string = [amzCookies componentsJoinedByString:@"; "];
             }]];
         }
 
-        [alert addAction:[UIAlertAction actionWithTitle:[NSString stringWithFormat:@"Cookies: Copy Tất Cả (%lu)", (unsigned long)allCookies.count] style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-            if (allCookies.count > 0) {
-                [UIPasteboard generalPasteboard].string = [allCookies componentsJoinedByString:@"; "];
-            }
+        [alert addAction:[UIAlertAction actionWithTitle:@"Info: Copy Diagnostic Report" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+            [self copyDiagnosticReportWithAmzCookies:amzCookies allCookies:allCookies];
         }]];
 
         NSString *visTitle = sm.isButtonVisible ? @"Chế độ: Ẩn nút nổi (Stealth)" : @"Chế độ: Hiện lại nút nổi";
@@ -1144,9 +1528,22 @@ static void SafariWipeInit(void) {
         [SWSpoofManager shared];
         InstallSafariHooks();
 
-        int token = 0;
-        notify_register_dispatch("com.custom.safari.wipe", &token, dispatch_get_main_queue(), ^(int t) {
+        // Lệnh 1: Chỉ Wipe (com.custom.safari.wipe)
+        int wipeToken = 0;
+        notify_register_dispatch("com.custom.safari.wipe", &wipeToken, dispatch_get_main_queue(), ^(int t) {
             PerformSafariDeepWipeAndRotate(YES);
+        });
+
+        // Lệnh 2: Chỉ Backup toàn bộ phiên hiện tại (com.custom.safari.backup)
+        int backupToken = 0;
+        notify_register_dispatch("com.custom.safari.backup", &backupToken, dispatch_get_main_queue(), ^(int t) {
+            PerformFullSafariBackup(@"AutoTouch", NO, nil);
+        });
+
+        // Lệnh 3: Backup toàn bộ xong tự động Wipe sang máy mới (com.custom.safari.backup_and_wipe)
+        int bwToken = 0;
+        notify_register_dispatch("com.custom.safari.backup_and_wipe", &bwToken, dispatch_get_main_queue(), ^(int t) {
+            PerformFullSafariBackup(@"AutoTouch", YES, nil);
         });
 
         dispatch_async(dispatch_get_main_queue(), ^{
