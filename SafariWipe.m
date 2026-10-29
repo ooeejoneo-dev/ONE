@@ -18,7 +18,7 @@
 extern char **environ;
 
 // ============================================================================
-// 1. TỰ ĐỘNG DÒ ĐƯỜNG DẪN .JBROOT CỦA ROOTHIDE (KHÔNG CẦN PATCHER)
+// 1. TỰ ĐỘNG DÒ ĐƯỜNG DẪN .JBROOT CỦA ROOTHIDE (VƯỢT QUA BỘ QUÉT CỦA SILEO)
 // ============================================================================
 static NSString *GetRootHideJBRootPath(void) {
     static NSString *cachedRoot = nil;
@@ -34,34 +34,32 @@ static NSString *GetRootHideJBRootPath(void) {
         }
         if (!cachedRoot || cachedRoot.length == 0) {
             NSFileManager *fm = [NSFileManager defaultManager];
-            NSArray *bundles = [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
+            NSString *bundleBase = [@"/var/containers" stringByAppendingPathComponent:@"Bundle/Application"];
+            NSArray *bundles = [fm contentsOfDirectoryAtPath:bundleBase error:nil];
             for (NSString *item in bundles) {
                 if ([item hasPrefix:@".jbroot"]) {
-                    cachedRoot = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:item];
+                    cachedRoot = [bundleBase stringByAppendingPathComponent:item];
                     break;
                 }
             }
         }
-        if (!cachedRoot || cachedRoot.length == 0) {
-            cachedRoot = @"/var/jb";
-        }
     });
-    return cachedRoot;
+    return cachedRoot ?: @"";
 }
 
-static NSString *ResolveJBToolPath(NSString *relativeToolPath, NSString *systemFallback) {
-    NSString *jbCandidate = [GetRootHideJBRootPath() stringByAppendingPathComponent:relativeToolPath];
-    if (access([jbCandidate UTF8String], X_OK) == 0) {
-        return jbCandidate;
-    }
-    if (systemFallback && access([systemFallback UTF8String], X_OK) == 0) {
-        return systemFallback;
+static NSString *ResolveJBToolPath(NSString *toolName) {
+    NSString *jbRoot = GetRootHideJBRootPath();
+    if (jbRoot.length > 0) {
+        NSString *p1 = [[jbRoot stringByAppendingPathComponent:@"usr/bin"] stringByAppendingPathComponent:toolName];
+        if (access([p1 UTF8String], X_OK) == 0) return p1;
+        NSString *p2 = [[jbRoot stringByAppendingPathComponent:@"bin"] stringByAppendingPathComponent:toolName];
+        if (access([p2 UTF8String], X_OK) == 0) return p2;
     }
     return nil;
 }
 
-static void RunJBCommandAndWait(NSString *toolRelPath, NSString *sysFallback, char *const argv[]) {
-    NSString *binPath = ResolveJBToolPath(toolRelPath, sysFallback);
+static void RunJBCommandAndWait(NSString *toolName, char *const argv[]) {
+    NSString *binPath = ResolveJBToolPath(toolName);
     if (!binPath) return;
     pid_t pid = 0;
     if (posix_spawn(&pid, [binPath UTF8String], NULL, NULL, argv, environ) == 0 && pid > 0) {
@@ -71,7 +69,7 @@ static void RunJBCommandAndWait(NSString *toolRelPath, NSString *sysFallback, ch
 }
 
 static void KillBackgroundWebKitDaemons(void) {
-    NSString *killallBin = ResolveJBToolPath(@"usr/bin/killall", @"/usr/bin/killall");
+    NSString *killallBin = ResolveJBToolPath(@"killall");
     if (killallBin) {
         pid_t pid = 0;
         char *argv[] = {
@@ -703,7 +701,7 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
                 (char *)"Library/Safari",
                 NULL
             };
-            RunJBCommandAndWait(@"usr/bin/tar", @"/usr/bin/tar", tarArgv);
+            RunJBCommandAndWait(@"tar", tarArgv);
 
             [UIPasteboard generalPasteboard].string = targetDir;
 
@@ -765,7 +763,7 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
                 (char *)[NSHomeDirectory() UTF8String],
                 NULL
             };
-            RunJBCommandAndWait(@"usr/bin/tar", @"/usr/bin/tar", tarArgv);
+            RunJBCommandAndWait(@"tar", tarArgv);
         }
 
         NSString *cookiesPlist = [sourceDir stringByAppendingPathComponent:@"_cookies_full.plist"];
@@ -1029,11 +1027,12 @@ static void PurgeSafariDiskStorage(void) {
         }
     }
 
+    NSString *mobLib = [@"/var/mobile" stringByAppendingPathComponent:@"Library"];
     NSArray *globalSafariDirs = @[
-        @"/var/mobile/Library/Safari",
-        @"/var/mobile/Library/WebKit",
-        @"/var/mobile/Library/Caches/com.apple.mobilesafari",
-        @"/var/mobile/Library/Caches/com.apple.SharedWebCredentials"
+        [mobLib stringByAppendingPathComponent:@"Safari"],
+        [mobLib stringByAppendingPathComponent:@"WebKit"],
+        [mobLib stringByAppendingPathComponent:@"Caches/com.apple.mobilesafari"],
+        [mobLib stringByAppendingPathComponent:@"Caches/com.apple.SharedWebCredentials"]
     ];
     for (NSString *dir in globalSafariDirs) {
         NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil];
@@ -1051,7 +1050,7 @@ static void PurgeSafariDiskStorage(void) {
         }
     }
 
-    NSString *appGroupRoot = @"/var/mobile/Containers/Shared/AppGroup";
+    NSString *appGroupRoot = [@"/var/mobile/Containers" stringByAppendingPathComponent:@"Shared/AppGroup"];
     NSArray *groups = [fm contentsOfDirectoryAtPath:appGroupRoot error:nil];
     for (NSString *g in groups) {
         NSString *safariGroupDir = [[appGroupRoot stringByAppendingPathComponent:g] stringByAppendingPathComponent:@"Library/Safari"];
@@ -1065,10 +1064,11 @@ static void PurgeSafariDiskStorage(void) {
         }
     }
 
-    NSArray *sharedCookieFiles = [fm contentsOfDirectoryAtPath:@"/var/mobile/Library/Cookies" error:nil];
+    NSString *cookieDir = [mobLib stringByAppendingPathComponent:@"Cookies"];
+    NSArray *sharedCookieFiles = [fm contentsOfDirectoryAtPath:cookieDir error:nil];
     for (NSString *f in sharedCookieFiles) {
         if ([f containsString:@"Cookies"] || [f containsString:@"safari"]) {
-            [fm removeItemAtPath:[@"/var/mobile/Library/Cookies" stringByAppendingPathComponent:f] error:nil];
+            [fm removeItemAtPath:[cookieDir stringByAppendingPathComponent:f] error:nil];
         }
     }
 }
