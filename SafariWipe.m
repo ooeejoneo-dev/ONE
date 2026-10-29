@@ -13,9 +13,85 @@
 #import <unistd.h>
 #import <stdlib.h>
 #import <sys/wait.h>
+#import <dlfcn.h>
 
 extern char **environ;
 
+// ============================================================================
+// 1. TỰ ĐỘNG DÒ ĐƯỜNG DẪN .JBROOT CỦA ROOTHIDE (KHÔNG CẦN PATCHER)
+// ============================================================================
+static NSString *GetRootHideJBRootPath(void) {
+    static NSString *cachedRoot = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Dl_info info;
+        if (dladdr((const void *)&GetRootHideJBRootPath, &info) && info.dli_fname) {
+            NSString *dylibPath = [NSString stringWithUTF8String:info.dli_fname];
+            NSRange r = [dylibPath rangeOfString:@"/Library/MobileSubstrate"];
+            if (r.location != NSNotFound) {
+                cachedRoot = [dylibPath substringToIndex:r.location];
+            }
+        }
+        if (!cachedRoot || cachedRoot.length == 0) {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSArray *bundles = [fm contentsOfDirectoryAtPath:@"/var/containers/Bundle/Application" error:nil];
+            for (NSString *item in bundles) {
+                if ([item hasPrefix:@".jbroot"]) {
+                    cachedRoot = [@"/var/containers/Bundle/Application" stringByAppendingPathComponent:item];
+                    break;
+                }
+            }
+        }
+        if (!cachedRoot || cachedRoot.length == 0) {
+            cachedRoot = @"/var/jb";
+        }
+    });
+    return cachedRoot;
+}
+
+static NSString *ResolveJBToolPath(NSString *relativeToolPath, NSString *systemFallback) {
+    NSString *jbCandidate = [GetRootHideJBRootPath() stringByAppendingPathComponent:relativeToolPath];
+    if (access([jbCandidate UTF8String], X_OK) == 0) {
+        return jbCandidate;
+    }
+    if (systemFallback && access([systemFallback UTF8String], X_OK) == 0) {
+        return systemFallback;
+    }
+    return nil;
+}
+
+static void RunJBCommandAndWait(NSString *toolRelPath, NSString *sysFallback, char *const argv[]) {
+    NSString *binPath = ResolveJBToolPath(toolRelPath, sysFallback);
+    if (!binPath) return;
+    pid_t pid = 0;
+    if (posix_spawn(&pid, [binPath UTF8String], NULL, NULL, argv, environ) == 0 && pid > 0) {
+        int status = 0;
+        waitpid(pid, &status, 0);
+    }
+}
+
+static void KillBackgroundWebKitDaemons(void) {
+    NSString *killallBin = ResolveJBToolPath(@"usr/bin/killall", @"/usr/bin/killall");
+    if (killallBin) {
+        pid_t pid = 0;
+        char *argv[] = {
+            (char *)"killall",
+            (char *)"-9",
+            (char *)"com.apple.WebKit.Networking",
+            (char *)"com.apple.WebKit.WebContent",
+            (char *)"com.apple.WebKit.GPU",
+            (char *)"SafariViewService",
+            (char *)"webbookmarksd",
+            (char *)"swcd",
+            NULL
+        };
+        posix_spawn(&pid, [killallBin UTF8String], NULL, NULL, argv, environ);
+    }
+}
+
+// ============================================================================
+// 2. THEO DÕI TOÀN BỘ WKWEBVIEW ĐANG MỞ TRÊN SAFARI
+// ============================================================================
 static NSHashTable<WKWebView *> *gTrackedWebViews = nil;
 
 static void TrackWebView(WKWebView *wv) {
@@ -57,52 +133,9 @@ static NSSet<WKWebView *> *GetAllActiveSafariWebViews(void) {
     return all;
 }
 
-static void RunCommandAndWait(const char *binCandidates[], char *const argv[]) {
-    const char *binPath = NULL;
-    for (int i = 0; binCandidates[i] != NULL; i++) {
-        if (access(binCandidates[i], X_OK) == 0) {
-            binPath = binCandidates[i];
-            break;
-        }
-    }
-    if (!binPath) return;
-    pid_t pid = 0;
-    if (posix_spawn(&pid, binPath, NULL, NULL, argv, environ) == 0 && pid > 0) {
-        int status = 0;
-        waitpid(pid, &status, 0);
-    }
-}
-
-static void KillBackgroundWebKitDaemons(void) {
-    const char *killallPaths[] = {
-        "/var/jb/usr/bin/killall",
-        "/usr/bin/killall",
-        NULL
-    };
-    const char *binPath = NULL;
-    for (int i = 0; killallPaths[i] != NULL; i++) {
-        if (access(killallPaths[i], X_OK) == 0) {
-            binPath = killallPaths[i];
-            break;
-        }
-    }
-    if (binPath) {
-        pid_t pid = 0;
-        char *argv[] = {
-            (char *)"killall",
-            (char *)"-9",
-            (char *)"com.apple.WebKit.Networking",
-            (char *)"com.apple.WebKit.WebContent",
-            (char *)"com.apple.WebKit.GPU",
-            (char *)"SafariViewService",
-            (char *)"webbookmarksd",
-            (char *)"swcd",
-            NULL
-        };
-        posix_spawn(&pid, binPath, NULL, NULL, argv, environ);
-    }
-}
-
+// ============================================================================
+// 3. QUẢN LÝ HỒ SƠ GIẢ LẬP PHẦN CỨNG (iOS 16.6+ ONLY & ZERO-FOOTPRINT JS)
+// ============================================================================
 @interface SWSpoofManager : NSObject
 @property (nonatomic, copy) NSString *userAgent;
 @property (nonatomic, copy) NSString *iosVersion;
@@ -447,6 +480,9 @@ static void KillBackgroundWebKitDaemons(void) {
 
 @end
 
+// ============================================================================
+// 4. THU THẬP COOKIE ĐA TẦNG & HỆ THỐNG BACKUP / RESTORE TOÀN DIỆN
+// ============================================================================
 static void CollectAllSafariCookiesDetailed(void (^completion)(NSArray<NSString *> *amzPairs, NSArray<NSString *> *allPairs, NSArray<NSDictionary *> *cookieDicts)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableDictionary<NSString *, NSString *> *amzMap = [NSMutableDictionary dictionary];
@@ -656,7 +692,6 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
             [metaData writeToFile:[targetDir stringByAppendingPathComponent:@"_meta.json"] atomically:YES];
 
             NSString *tarFile = [targetDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
-            const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
             char *tarArgv[] = {
                 (char *)"tar",
                 (char *)"-czf",
@@ -668,7 +703,7 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
                 (char *)"Library/Safari",
                 NULL
             };
-            RunCommandAndWait(tarBins, tarArgv);
+            RunJBCommandAndWait(@"usr/bin/tar", @"/usr/bin/tar", tarArgv);
 
             [UIPasteboard generalPasteboard].string = targetDir;
 
@@ -722,7 +757,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
 
         NSString *tarFile = [sourceDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
         if ([fm fileExistsAtPath:tarFile]) {
-            const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
             char *tarArgv[] = {
                 (char *)"tar",
                 (char *)"-xzf",
@@ -731,7 +765,7 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
                 (char *)[NSHomeDirectory() UTF8String],
                 NULL
             };
-            RunCommandAndWait(tarBins, tarArgv);
+            RunJBCommandAndWait(@"usr/bin/tar", @"/usr/bin/tar", tarArgv);
         }
 
         NSString *cookiesPlist = [sourceDir stringByAppendingPathComponent:@"_cookies_full.plist"];
@@ -790,6 +824,9 @@ static void CheckAndApplyPendingRestoreIfNeeded(WKWebView *webView) {
     }
 }
 
+// ============================================================================
+// 5. HOOKS HỆ THỐNG WEBKIT & UISCREEN / LOCALE / CARRIER
+// ============================================================================
 static IMP orig_WKWebView_initWithFrameConfig = NULL;
 static IMP orig_WKWebView_setCustomUA = NULL;
 static IMP orig_WKWebView_loadRequest = NULL;
@@ -921,6 +958,9 @@ static void InstallSafariHooks(void) {
     });
 }
 
+// ============================================================================
+// 6. XÓA SẠCH DỮ LIỆU SAFARI (DEEP WIPE) & GIAO DIỆN ĐIỀU KHIỂN NỔI
+// ============================================================================
 @interface SWFloatingWindow : UIWindow
 @property (nonatomic, strong) UIButton *fabButton;
 @end
@@ -1233,9 +1273,6 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     }
 }
 
-// ============================================================================
-// HỘP THOẠI XÁC NHẬN KHI CHẠM VÀO NÚT WIPE (CHỐNG BẤM NHẦM)
-// ============================================================================
 - (void)onWipeTapped:(UIButton *)sender {
     if (!gOverlayWindow || !gOverlayWindow.rootViewController) return;
     if (gOverlayWindow.rootViewController.presentedViewController) return;
@@ -1416,8 +1453,9 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     NSArray<NSString *> *targetCookies = amzCookies.count > 0 ? amzCookies : allCookies;
     NSString *cookieBlock = targetCookies.count > 0 ? [targetCookies componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V7.2 DIAGNOSTIC (CONFIRM & BACKUP SUITE) ===\n"
-        @"Time: %@\n\n"
+        @"=== SAFARI V7.2 DIAGNOSTIC (NATIVE ROOTHIDE) ===\n"
+        @"Time: %@\n"
+        @"JBRoot: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
         @"Spoofed IDFA:            %@\n"
@@ -1437,6 +1475,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
         @"--- COOKIES (Amazon: %lu | Total: %lu) ---\n"
         @"%@\n",
         [[NSDate date] description],
+        GetRootHideJBRootPath(),
         sm.idfv, sm.idfa, sm.serial, (long)sm.canvasSeed,
         sm.iosVersion, scr.size.width * scale, scr.size.height * scale, scale, memGB, sm.userAgent,
         sm.localeCode, sm.timeZoneName,
@@ -1472,7 +1511,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             sm.serial, sm.idfv,
             sm.userAgent];
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.2 (Confirm & Backup)"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.2 (Native RootHide)"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
