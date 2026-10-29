@@ -147,7 +147,7 @@ static void KillBackgroundWebKitDaemons(void) {
 - (NSString *)profilePath {
     NSString *docDir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
     [[NSFileManager defaultManager] createDirectoryAtPath:docDir withIntermediateDirectories:YES attributes:nil error:nil];
-    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v70.plist"];
+    return [docDir stringByAppendingPathComponent:@".safari_amzfr_v72.plist"];
 }
 
 - (NSString *)randomStringWithChars:(NSString *)chars length:(NSUInteger)len {
@@ -447,9 +447,6 @@ static void KillBackgroundWebKitDaemons(void) {
 
 @end
 
-// ============================================================================
-// THU THẬP COOKIE ĐA TẦNG (TRẢ VỀ CẢ ĐỐI TƯỢNG NSHTTPCookie ĐẦY ĐỦ THUỘC TÍNH)
-// ============================================================================
 static void CollectAllSafariCookiesDetailed(void (^completion)(NSArray<NSString *> *amzPairs, NSArray<NSString *> *allPairs, NSArray<NSDictionary *> *cookieDicts)) {
     dispatch_async(dispatch_get_main_queue(), ^{
         NSMutableDictionary<NSString *, NSString *> *amzMap = [NSMutableDictionary dictionary];
@@ -577,9 +574,6 @@ static void CollectAllSafariCookiesDetailed(void (^completion)(NSArray<NSString 
     });
 }
 
-// ============================================================================
-// QUẢN LÝ SAO LƯU & KHÔI PHỤC TOÀN DIỆN (BACKUP & RESTORE MANAGER)
-// ============================================================================
 static NSString *GetSafariBackupRootDirectory(void) {
     NSString *dir = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/SafariBackups"];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
@@ -597,7 +591,7 @@ static NSArray<NSString *> *ListAvailableBackups(void) {
         }
     }
     [valid sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
-        return [b compare:a]; // Mới nhất lên đầu
+        return [b compare:a];
     }];
     return valid;
 }
@@ -613,7 +607,6 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
         df.dateFormat = @"yyyyMMdd_HHmmss";
         NSString *timeStr = [df stringFromDate:[NSDate date]];
 
-        // Làm sạch nhãn ghi chú
         NSString *cleanTag = [[customLabel ?: @"" componentsSeparatedByCharactersInSet:[[NSCharacterSet alphanumericCharacterSet] invertedSet]] componentsJoinedByString:@"_"];
         if (cleanTag.length == 0) {
             cleanTag = [NSString stringWithFormat:@"%@_%@", sm.iosVersion ?: @"16.6", [sm.serial substringToIndex:MIN((NSUInteger)6, sm.serial.length)]];
@@ -624,19 +617,14 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
         NSFileManager *fm = [NSFileManager defaultManager];
         [fm createDirectoryAtPath:targetDir withIntermediateDirectories:YES attributes:nil error:nil];
 
-        // 1. Lưu cấu hình Spoof Profile hiện tại
         [sm saveProfile];
         [fm copyItemAtPath:[sm profilePath] toPath:[targetDir stringByAppendingPathComponent:@"_spoof_profile.plist"] error:nil];
-
-        // 2. Lưu mảng NSHTTPCookie đầy đủ thuộc tính (bao gồm HttpOnly)
         [cookieDicts writeToFile:[targetDir stringByAppendingPathComponent:@"_cookies_full.plist"] atomically:YES];
 
-        // 3. Lưu chuỗi Cookie dạng text dễ copy
         NSString *amzTxt = [amzPairs componentsJoinedByString:@"; "];
         NSString *allTxt = [allPairs componentsJoinedByString:@"; "];
         [(amzTxt.length > 0 ? amzTxt : allTxt) writeToFile:[targetDir stringByAppendingPathComponent:@"_cookies_header.txt"] atomically:YES encoding:NSUTF8StringEncoding error:nil];
 
-        // 4. Trích xuất localStorage, sessionStorage và URL từ WKWebView đang mở
         NSSet<WKWebView *> *webViews = GetAllActiveSafariWebViews();
         WKWebView *activeWV = [webViews anyObject];
         for (WKWebView *wv in webViews) {
@@ -667,7 +655,6 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
             NSData *metaData = [NSJSONSerialization dataWithJSONObject:meta options:NSJSONWritingPrettyPrinted error:nil];
             [metaData writeToFile:[targetDir stringByAppendingPathComponent:@"_meta.json"] atomically:YES];
 
-            // 5. Nén thêm thư mục Library/Cookies, Library/WebKit, Library/Safari trên đĩa
             NSString *tarFile = [targetDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
             const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
             char *tarArgv[] = {
@@ -683,7 +670,6 @@ static void PerformFullSafariBackup(NSString *customLabel, BOOL wipeAfterBackup,
             };
             RunCommandAndWait(tarBins, tarArgv);
 
-            // Copyパス vào Clipboard để AutoTouch / người dùng dễ kiểm tra
             [UIPasteboard generalPasteboard].string = targetDir;
 
             if (doneBlock) {
@@ -713,11 +699,9 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
         NSFileManager *fm = [NSFileManager defaultManager];
         if (![fm fileExistsAtPath:sourceDir]) return;
 
-        // 1. Đóng toàn bộ Tab hiện tại và xóa sạch dữ liệu phiên cũ
         CloseAllSafariOpenTabsInRAM();
         PurgeSafariDiskStorage();
 
-        // 2. Khôi phục file cấu hình Spoof Profile (IDFV, Serial, Canvas Seed, UA)
         NSString *savedSpoofPath = [sourceDir stringByAppendingPathComponent:@"_spoof_profile.plist"];
         NSString *activeSpoofPath = [[SWSpoofManager shared] profilePath];
         if ([fm fileExistsAtPath:savedSpoofPath]) {
@@ -726,7 +710,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
             [[SWSpoofManager shared] loadOrGenerateProfile];
         }
 
-        // Đọc _webstorage.json và _meta.json để tự động bơm lại vào trang khi mở Safari
         NSString *wsPath = [sourceDir stringByAppendingPathComponent:@"_webstorage.json"];
         NSString *wsJSON = [NSString stringWithContentsOfFile:wsPath encoding:NSUTF8StringEncoding error:nil];
         NSData *metaData = [NSData dataWithContentsOfFile:[sourceDir stringByAppendingPathComponent:@"_meta.json"]];
@@ -737,7 +720,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
         [SWSpoofManager shared].pendingRestoreURL = restoreURL;
         [[SWSpoofManager shared] saveProfile];
 
-        // 3. Giải nén lại thư mục Library/Cookies, Library/WebKit, Library/Safari
         NSString *tarFile = [sourceDir stringByAppendingPathComponent:@"disk_storage.tar.gz"];
         if ([fm fileExistsAtPath:tarFile]) {
             const char *tarBins[] = {"/var/jb/usr/bin/tar", "/usr/bin/tar", NULL};
@@ -752,7 +734,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
             RunCommandAndWait(tarBins, tarArgv);
         }
 
-        // 4. Nạp lại toàn bộ đối tượng NSHTTPCookie vào cả NSHTTPCookieStorage lẫn WKHTTPCookieStore
         NSString *cookiesPlist = [sourceDir stringByAppendingPathComponent:@"_cookies_full.plist"];
         NSArray<NSDictionary *> *cookieDicts = [NSArray arrayWithContentsOfFile:cookiesPlist];
         WKHTTPCookieStore *wkStore = [WKWebsiteDataStore defaultDataStore].httpCookieStore;
@@ -770,7 +751,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
             }
         }
 
-        // Sau khi nạp xong Cookie vào Store thì đóng Safari để khởi động sạch với Profile vừa Restore
         dispatch_group_notify(grp, dispatch_get_main_queue(), ^{
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
                 _exit(0);
@@ -779,7 +759,6 @@ static void PerformFullSafariRestore(NSString *backupFolderName) {
     });
 }
 
-// Tự động nạp lại Cookie và WebStorage sau khi vừa Restore và mở lại Safari
 static void CheckAndApplyPendingRestoreIfNeeded(WKWebView *webView) {
     SWSpoofManager *sm = [SWSpoofManager shared];
     if (!sm.pendingRestoreURL && !sm.pendingRestoreWebStorageJSON) return;
@@ -787,7 +766,6 @@ static void CheckAndApplyPendingRestoreIfNeeded(WKWebView *webView) {
     NSString *wsJSON = sm.pendingRestoreWebStorageJSON;
     NSString *targetURL = sm.pendingRestoreURL;
 
-    // Xóa cờ chờ để chỉ chạy 1 lần duy nhất
     sm.pendingRestoreWebStorageJSON = nil;
     sm.pendingRestoreURL = nil;
     [sm saveProfile];
@@ -1255,8 +1233,40 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     }
 }
 
+// ============================================================================
+// HỘP THOẠI XÁC NHẬN KHI CHẠM VÀO NÚT WIPE (CHỐNG BẤM NHẦM)
+// ============================================================================
 - (void)onWipeTapped:(UIButton *)sender {
-    PerformSafariDeepWipeAndRotate(YES);
+    if (!gOverlayWindow || !gOverlayWindow.rootViewController) return;
+    if (gOverlayWindow.rootViewController.presentedViewController) return;
+
+    SWSpoofManager *sm = [SWSpoofManager shared];
+    NSString *msg = [NSString stringWithFormat:
+        @"Bạn có chắc chắn muốn xóa trắng dữ liệu Safari và đổi sang máy mới không?\n\n"
+        @"• Máy hiện tại: iOS %@ | Serial: %@\n"
+        @"• Toàn bộ Tab, Cookie, LocalStorage và swcd sẽ bị xóa sạch.",
+        sm.iosVersion ?: @"16.6",
+        sm.serial ?: @"N/A"];
+
+    UIAlertController *confirmAlert = [UIAlertController alertControllerWithTitle:@"Xác nhận WIPE Safari?"
+                                                                          message:msg
+                                                                   preferredStyle:UIAlertControllerStyleAlert];
+
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Xác nhận WIPE Ngay (Không lưu)" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        PerformSafariDeepWipeAndRotate(YES);
+    }]];
+
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Sao Lưu Nhanh & WIPE" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        PerformFullSafariBackup(@"QuickConfirm", YES, nil);
+    }]];
+
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Mở Menu Chính (V7.2)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        [self showMainPanel];
+    }]];
+
+    [confirmAlert addAction:[UIAlertAction actionWithTitle:@"Hủy (Giữ nguyên phiên)" style:UIAlertActionStyleCancel handler:nil]];
+
+    [gOverlayWindow.rootViewController presentViewController:confirmAlert animated:YES completion:nil];
 }
 
 - (void)onTripleFingerTap:(UITapGestureRecognizer *)tap {
@@ -1271,9 +1281,6 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     }
 }
 
-// ============================================================================
-// MENU QUẢN LÝ SAO LƯU & KHÔI PHỤC (BACKUP & RESTORE SUB-MENU)
-// ============================================================================
 - (void)promptCustomLabelAndBackupWithWipe:(BOOL)wipeAfter {
     UIAlertController *prompt = [UIAlertController alertControllerWithTitle:wipeAfter ? @"Sao lưu & Wipe sang máy mới" : @"Sao lưu toàn bộ phiên hiện tại"
                                                                     message:@"Nhập tên gợi nhớ (VD: AccPhap01, Mail...) hoặc để trống để tự đặt theo Serial:"
@@ -1361,7 +1368,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     NSArray<NSString *> *backups = ListAvailableBackups();
     NSString *msg = [NSString stringWithFormat:@"Thư mục: Documents/SafariBackups\nHiện có: %lu bản sao lưu toàn diện (Cookies + LocalStorage + Disk + Hồ sơ phần cứng)", (unsigned long)backups.count];
 
-    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu Sao Lưu & Khôi Phục (V7.1)"
+    UIAlertController *menu = [UIAlertController alertControllerWithTitle:@"Menu Sao Lưu & Khôi Phục (V7.2)"
                                                                   message:msg
                                                            preferredStyle:UIAlertControllerStyleAlert];
 
@@ -1373,7 +1380,6 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
         [self promptCustomLabelAndBackupWithWipe:YES];
     }]];
 
-    // Hiển thị danh sách 10 bản sao lưu gần nhất để chọn Restore ngay
     NSUInteger limit = MIN(backups.count, (NSUInteger)10);
     for (NSUInteger i = 0; i < limit; i++) {
         NSString *folderName = backups[i];
@@ -1410,7 +1416,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
     NSArray<NSString *> *targetCookies = amzCookies.count > 0 ? amzCookies : allCookies;
     NSString *cookieBlock = targetCookies.count > 0 ? [targetCookies componentsJoinedByString:@"; "] : @"(no cookies)";
     NSString *report = [NSString stringWithFormat:
-        @"=== SAFARI V7.1 DIAGNOSTIC (BACKUP SUITE) ===\n"
+        @"=== SAFARI V7.2 DIAGNOSTIC (CONFIRM & BACKUP SUITE) ===\n"
         @"Time: %@\n\n"
         @"--- IDENTITY ---\n"
         @"Spoofed IDFV:            %@\n"
@@ -1466,7 +1472,7 @@ static void PerformSafariDeepWipeAndRotate(BOOL shouldExitAfterWipe) {
             sm.serial, sm.idfv,
             sm.userAgent];
 
-        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.1 (Backup Suite)"
+        UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Safari Spoof V7.2 (Confirm & Backup)"
                                                                        message:msg
                                                                 preferredStyle:UIAlertControllerStyleAlert];
 
@@ -1528,19 +1534,16 @@ static void SafariWipeInit(void) {
         [SWSpoofManager shared];
         InstallSafariHooks();
 
-        // Lệnh 1: Chỉ Wipe (com.custom.safari.wipe)
         int wipeToken = 0;
         notify_register_dispatch("com.custom.safari.wipe", &wipeToken, dispatch_get_main_queue(), ^(int t) {
             PerformSafariDeepWipeAndRotate(YES);
         });
 
-        // Lệnh 2: Chỉ Backup toàn bộ phiên hiện tại (com.custom.safari.backup)
         int backupToken = 0;
         notify_register_dispatch("com.custom.safari.backup", &backupToken, dispatch_get_main_queue(), ^(int t) {
             PerformFullSafariBackup(@"AutoTouch", NO, nil);
         });
 
-        // Lệnh 3: Backup toàn bộ xong tự động Wipe sang máy mới (com.custom.safari.backup_and_wipe)
         int bwToken = 0;
         notify_register_dispatch("com.custom.safari.backup_and_wipe", &bwToken, dispatch_get_main_queue(), ^(int t) {
             PerformFullSafariBackup(@"AutoTouch", YES, nil);
